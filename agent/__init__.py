@@ -9,13 +9,14 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import asyncio
+import json
 import logging
 import os
 from typing import Any
 
 import typer
 
-from agent.agent import MiniMaxAgent
+from agent.agent import GeminiAgent
 from agent.detect import get_project_name
 from agent.repl import REPLSession
 from agent.session import get_telegram_config
@@ -33,6 +34,9 @@ from trigger.engine import TriggerEngine
 from trigger.rules import (
     CriticalKeywordRule,
     HttpErrorRule,
+    MetricThresholdRule,
+    ClusterFormationRule,
+    SilenceAnomalyRule,
     NewErrorTypeRule,
     RateSpikeRule,
 )
@@ -57,6 +61,12 @@ def main_callback(ctx: typer.Context) -> None:
 @app.command()
 def run(
     cwd: Path | None = typer.Option(None, "--cwd", help="Project root directory"),
+    auto_install: bool = typer.Option(
+        False, "--auto-install", help="Automatically install missing dependencies without prompting"
+    ),
+    skip_deps_check: bool = typer.Option(
+        False, "--skip-deps-check", help="Skip dependency check before starting services"
+    ),
 ) -> None:
     """Auto-detect project, start dev server, and monitor logs (legacy)."""
     import os
@@ -65,7 +75,15 @@ def run(
         os.chdir(cwd)
 
     from agent.run import run as run_session
-    asyncio.run(run_session())
+    from config import load as load_config
+
+    cfg = load_config()
+    deps_cfg = cfg.get("deps", {})
+    # CLI flags override config; config defaults are False
+    final_auto_install = auto_install or deps_cfg.get("auto_install", False)
+    final_skip_check = skip_deps_check or deps_cfg.get("skip_check", False)
+
+    asyncio.run(run_session(auto_install=final_auto_install, skip_deps_check=final_skip_check))
 
 
 @app.command()
@@ -102,22 +120,37 @@ def project(
         if sys.platform == "win32":
             CREATE_NEW_CONSOLE = 0x00000010
             proc = subprocess.Popen(
-                cmd,
+                    cmd,
+                    cwd=str(abs_path),
+                    creationflags=CREATE_NEW_CONSOLE,
+                )
+        elif sys.platform == "darwin":
+            # macOS: open a new Terminal window
+            osa_script = f'tell app "Terminal" to do script "{" ".join(cmd)}"'
+            proc = subprocess.Popen(
+                ["osascript", "-e", osa_script],
                 cwd=str(abs_path),
-                creationflags=CREATE_NEW_CONSOLE,
             )
         else:
-            import os
+            # Linux: try gnome-terminal → xterm → tmux
             try:
                 proc = subprocess.Popen(
                     ["gnome-terminal", "--", "bash", "-c", f"{' '.join(cmd)}; exec bash"],
                     cwd=str(abs_path),
                 )
             except FileNotFoundError:
-                proc = subprocess.Popen(
-                    ["xterm", "-hold", "-e", " ".join(cmd)],
-                    cwd=str(abs_path),
-                )
+                try:
+                    proc = subprocess.Popen(
+                        ["xterm", "-hold", "-e", " ".join(cmd)],
+                        cwd=str(abs_path),
+                    )
+                except FileNotFoundError:
+                    # tmux fallback: open a new window in the current session
+                    session = f"lw-{project_name}"
+                    proc = subprocess.Popen(
+                        ["tmux", "new-window", "-n", session, " ".join(cmd)],
+                        cwd=str(abs_path),
+                    )
 
         processes.append((project_name, proc))
         typer.echo(f"[green]Started {project_name}[/green] (PID {proc.pid})")
@@ -144,7 +177,7 @@ def shell(
         None, "--log-file", help="Log file path (overrides config default)"
     ),
     model: str = typer.Option(
-        "MiniMax-Text-01", "--model", help="LLM model name"
+        "gemini-2.5-flash", "--model", help="Gemini model name"
     ),
     api_key: str | None = None,
     no_notification: bool = typer.Option(
@@ -152,12 +185,16 @@ def shell(
     ),
 ) -> None:
     """Interactive mode: run commands and monitor logs in the same terminal."""
-    api_key = api_key or os.environ.get("MINIMAX_API_KEY", "")
+    api_key = api_key or os.environ.get("GEMINI_API_KEY", "")
     if not api_key:
-        log.error("No API key provided. Set MINIMAX_API_KEY or use --api-key")
+        log.error("No API key provided. Set GEMINI_API_KEY or use --api-key")
         raise typer.Exit(1)
 
     cfg = load_config()
+    trigger_cfg = cfg.get("triggers", {})
+    rate_cfg = trigger_cfg.get("rate_spike", {})
+    crit_cfg = trigger_cfg.get("critical_keyword", {})
+    jsonl_cfg = cfg.get("output", {}).get("jsonl", {})
     default_files = cfg.get("watch", {}).get("default_files", [])
     log_path = log_file or (default_files[0] if default_files else "./logs/app.log")
 
@@ -168,13 +205,19 @@ def shell(
 
     rules = [
         NewErrorTypeRule(),
-        RateSpikeRule(threshold=3, window_seconds=10),
-        CriticalKeywordRule(),
+        RateSpikeRule(
+            threshold=rate_cfg.get("threshold", 3),
+            window_seconds=rate_cfg.get("window_seconds", 10),
+        ),
+        CriticalKeywordRule(extra_keywords=crit_cfg.get("extra_keywords", [])),
         HttpErrorRule(),
+        MetricThresholdRule(),
+        ClusterFormationRule(),
+        SilenceAnomalyRule(),
     ]
 
     engine = TriggerEngine(rules=rules, cooldowns=cooldowns, agent_queue=agent_queue)
-    agent = MiniMaxAgent(api_key=api_key, model=model)
+    agent = GeminiAgent(api_key=api_key, model=model)
     notifier = None if no_notification else WindowsNotifier()
 
     # Telegram notifier — only if configured
@@ -197,9 +240,18 @@ def shell(
                 log.warning("Notification failed: %s", exc)
         if telegram_notifier:
             try:
-                telegram_notifier.notify(finding, project=get_project_name())
+                await telegram_notifier.notify(finding, project=get_project_name())
             except Exception as exc:
                 log.warning("Telegram notification failed: %s", exc)
+        # Write to JSONL
+        if jsonl_cfg.get("enabled", True):
+            try:
+                jsonl_path = Path(jsonl_cfg.get("path", ".logwhisper/alerts.jsonl"))
+                jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(jsonl_path, "a", encoding="utf-8") as jf:
+                    jf.write(json.dumps(finding) + "\n")
+            except Exception as exc:
+                log.warning("JSONL write failed: %s", exc)
         print_alert(finding, suppressed_count=engine.suppression_count)
 
     # Start log monitoring
@@ -263,10 +315,10 @@ def watch(
         BUFFER_MAXLEN, "--buffer", "-b", help="Ring buffer max lines"
     ),
     model: str = typer.Option(
-        "MiniMax-Text-01", "--model", help="LLM model name"
+        "gemini-2.5-flash", "--model", help="Gemini model name"
     ),
     api_key: str = typer.Option(
-        None, "--api-key", help="MiniMax API key (or set MINIMAX_API_KEY env)"
+        None, "--api-key", help="Gemini API key (or set GEMINI_API_KEY env)"
     ),
     no_notification: bool = typer.Option(
         False, "--no-notification", help="Disable Windows toast notifications"
@@ -276,13 +328,16 @@ def watch(
     ),
 ) -> None:
     """Watch log file(s) in real-time and fire AI-analyzed alerts."""
-    api_key = api_key or os.environ.get("MINIMAX_API_KEY", "")
+    api_key = api_key or os.environ.get("GEMINI_API_KEY", "")
     if not api_key:
-        log.error("No API key provided. Set MINIMAX_API_KEY or use --api-key")
+        log.error("No API key provided. Set GEMINI_API_KEY or use --api-key")
         raise typer.Exit(1)
 
-    # Load config for defaults
     cfg = load_config()
+    trigger_cfg = cfg.get("triggers", {})
+    rate_cfg = trigger_cfg.get("rate_spike", {})
+    crit_cfg = trigger_cfg.get("critical_keyword", {})
+    jsonl_cfg = cfg.get("output", {}).get("jsonl", {})
 
     # Use CLI files, else fall back to config defaults
     if not file:
@@ -306,13 +361,19 @@ def watch(
 
     rules = [
         NewErrorTypeRule(),
-        RateSpikeRule(threshold=3, window_seconds=10),
-        CriticalKeywordRule(),
+        RateSpikeRule(
+            threshold=rate_cfg.get("threshold", 3),
+            window_seconds=rate_cfg.get("window_seconds", 10),
+        ),
+        CriticalKeywordRule(extra_keywords=crit_cfg.get("extra_keywords", [])),
         HttpErrorRule(),
+        MetricThresholdRule(),
+        ClusterFormationRule(),
+        SilenceAnomalyRule(),
     ]
 
     engine = TriggerEngine(rules=rules, cooldowns=cooldowns, agent_queue=agent_queue)
-    agent = MiniMaxAgent(api_key=api_key, model=model)
+    agent = GeminiAgent(api_key=api_key, model=model)
     windows_notifier = None if no_notification else WindowsNotifier()
 
     # Telegram notifier — only if configured and not disabled
@@ -351,12 +412,22 @@ def watch(
         # Telegram alert
         if telegram_notifier:
             try:
-                telegram_notifier.notify(finding, project=get_project_name())
+                await telegram_notifier.notify(finding, project=get_project_name())
             except Exception as exc:
                 log.warning("Telegram notification failed: %s", exc)
 
         # Terminal print
         print_alert(finding, suppressed_count=engine.suppression_count)
+
+        # Write to JSONL
+        if jsonl_cfg.get("enabled", True):
+            try:
+                jsonl_path = Path(jsonl_cfg.get("path", ".logwhisper/alerts.jsonl"))
+                jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(jsonl_path, "a", encoding="utf-8") as jf:
+                    jf.write(json.dumps(finding) + "\n")
+            except Exception as exc:
+                log.warning("JSONL write failed: %s", exc)
 
         status.update(
             alert_count=finding_count,
@@ -435,7 +506,7 @@ def analyze(
     file: Path = typer.Option(..., "--file", help="Log file to analyze"),
     since: str = typer.Option(None, "--since", help="Filter logs since this time"),
     until: str = typer.Option(None, "--until", help="Filter logs until this time"),
-    model: str = typer.Option("MiniMax-Text-01", "--model"),
+    model: str = typer.Option("gemini-2.5-flash", "--model"),
     api_key: str = typer.Option(None, "--api-key"),
 ) -> None:
     """Analyze a log file in batch mode (not yet implemented)."""
@@ -506,38 +577,19 @@ def setup(
 
 
 def _setup_api_key_interactive(console: Console) -> None:
-    """Prompt for and save an API key (MiniMax or Gemini)."""
+    """Prompt for and save a Gemini API key."""
     from agent.session import save_global_api_key
 
     console.print("[cyan]Step 1:[/cyan] API Key Setup\n")
+    console.print("  Get your key at: [blue]https://aistudio.google.com/app/apikey[/blue]\n")
 
-    # Ask provider first
-    provider_choice = console.input(
-        "Which provider? ([bold]minimax[/bold] or [bold]gemini[/bold]): "
-    ).strip().lower()
-
-    if provider_choice not in ("minimax", "gemini"):
-        console.print("[red]Invalid choice. Must be 'minimax' or 'gemini'. Skipping.[/red]\n")
-        return
-
-    # Show provider-specific instructions
-    if provider_choice == "minimax":
-        console.print("  Get your key at: [blue]https://www.minimaxi.com/[/blue]\n")
-        key_label = "MiniMax API key"
-        env_hint = "MINIMAX_API_KEY"
-    else:
-        console.print("  Get your key at: [blue]https://aistudio.google.com/app/apikey[/blue]\n")
-        key_label = "Gemini API key"
-        env_hint = "GEMINI_API_KEY"
-
-    key = console.input(f"Enter your {key_label}: ").strip()
+    key = console.input("Enter your Gemini API key: ").strip()
     if not key:
         console.print("[red]API key cannot be empty. Skipping.[/red]\n")
         return
 
-    # Save provider and key
-    save_global_api_key(key.strip(), provider=provider_choice)
-    console.print(f"[green]API key saved![/green] ({provider_choice} using {key_label})\n")
+    save_global_api_key(key.strip(), provider="gemini")
+    console.print("[green]API key saved![/green] (gemini-2.5-flash ready)\n")
 
 
 def _setup_telegram_interactive(console: Console) -> None:
@@ -685,8 +737,8 @@ def chat(
         None, "--file", "-f", help="Load recent log lines from a file for context"
     ),
     provider: str = typer.Option(
-        "minimax", "--provider", "-p",
-        help="LLM provider: minimax or gemini",
+        "gemini", "--provider", "-p",
+        help="LLM provider (gemini)",
     ),
     model: str | None = typer.Option(
         None, "--model", "-m", help="Model name (defaults to provider's default)",
@@ -697,7 +749,7 @@ def chat(
 
     Run without arguments for interactive REPL mode, or use --error for single-shot analysis.
 
-    Provider can be set via --provider (minimax/gemini) or GEMINI_API_KEY / MINIMAX_API_KEY env vars.
+    Provider can be set via --provider or GEMINI_API_KEY env var.
     """
     from agent.chat import ChatAgent, get_project_context
     from agent.session import get_api_key_and_provider, get_fallback_key_and_provider
@@ -709,19 +761,12 @@ def chat(
     api_key, env_provider = get_api_key_and_provider()
     fallback_key, fallback_provider = get_fallback_key_and_provider()
 
-    # If user passed --provider explicitly, trust it.
-    # Otherwise, if the key came from GEMINI_API_KEY env, use gemini.
-    # The CLI default provider is "minimax", so we only upgrade to gemini
-    # when the env detects it and the user hasn't overridden.
+    # If the key came from GEMINI_API_KEY env, force provider to gemini.
     if api_key and env_provider == "gemini":
-        # Key is from GEMINI_API_KEY — switch provider unless user explicitly
-        # passed minimax (we detect this by checking if provider is still
-        # the CLI default AND env says gemini)
-        if provider == "minimax":
-            provider = "gemini"
+        provider = "gemini"
 
     if not api_key:
-        console.print("[red]No API key found.[/red] Set MINIMAX_API_KEY or GEMINI_API_KEY, or run [green]logwhisper setup[/green] first.")
+        console.print("[red]No API key found.[/red] Set GEMINI_API_KEY or run [green]logwhisper setup[/green] first.")
         raise typer.Exit(1)
 
     # Load project context once
@@ -756,7 +801,7 @@ def _run_single_shot_chat(
     project_ctx: dict,
     api_key: str,
     console: Console,
-    provider: str = "minimax",
+    provider: str = "gemini",
     model: str | None = None,
     fallback_key: str | None = None,
     fallback_provider: str = "gemini",
@@ -788,7 +833,7 @@ def _run_chat_repl(
     project_ctx: dict,
     api_key: str,
     console: Console,
-    provider: str = "minimax",
+    provider: str = "gemini",
     model: str | None = None,
     fallback_key: str | None = None,
     fallback_provider: str = "gemini",

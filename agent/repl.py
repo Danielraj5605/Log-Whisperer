@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 import subprocess
 import sys
@@ -16,12 +17,15 @@ from rich.rule import Rule
 from rich.table import Table
 from rich.text import Text
 
-from agent.agent import MiniMaxAgent
+from agent.agent import GeminiAgent
 from agent.chat import ChatAgent, get_project_context
 from agent.detect import detect_project_parts, detect_project_type, get_project_name
+from agent.deps import check_service_deps
 from agent.session import get_api_key, get_api_key_and_provider, get_fallback_key_and_provider, get_telegram_config
 from buffer.parser import parse
 from buffer.ring_buffer import RingBuffer
+from output.dashboard import Dashboard
+from output.terminal import print_service_log
 from ingest.file_adapter import FileAdapter
 from output.terminal import print_alert, print_service_log
 from output.telegram_notification import TelegramNotifier
@@ -31,6 +35,9 @@ from trigger.engine import TriggerEngine
 from trigger.rules import (
     CriticalKeywordRule,
     HttpErrorRule,
+    MetricThresholdRule,
+    ClusterFormationRule,
+    SilenceAnomalyRule,
     NewErrorTypeRule,
     RateSpikeRule,
 )
@@ -87,12 +94,12 @@ class REPLSession:
         # API key and provider — don't prompt during init, let /setup or /chat handle it
         api_key, detected_provider = get_api_key_and_provider()
         self._api_key = api_key
-        self._provider = detected_provider if detected_provider != "unknown" else "minimax"
+        self._provider = detected_provider if detected_provider != "unknown" else "gemini"
 
         # Monitoring components (created when services start)
         self._buffer: RingBuffer | None = None
         self._engine: TriggerEngine | None = None
-        self._agent: MiniMaxAgent | None = None
+        self._agent: GeminiAgent | None = None
         self._windows_notifier: WindowsNotifier | None = None
         self._telegram_notifier: TelegramNotifier | None = None
 
@@ -100,6 +107,9 @@ class REPLSession:
         self._processes: dict[str, asyncio.subprocess.Process] = {}
         self._log_files: dict[str, Any] = {}
         self._log_file_handles: dict[str, Any] = {}
+
+        # Dashboard
+        self._dashboard: Dashboard | None = None
 
         # Background tasks
         self._all_tasks: list[asyncio.Task[Any]] = []
@@ -193,7 +203,7 @@ class REPLSession:
             console.print(f"  [cyan]{name}[/cyan] — {info['command']}")
         console.print()
 
-        await self._start_all_services(list(self._parts.keys()))
+        await self._start_all_services(list(self._parts.keys()), use_dashboard=False)
         self._services_running = True
         console.print("[green]All services started.[/green]")
         console.print("[dim]Use /stop to stop them, or /chat to ask about errors.[/dim]\n")
@@ -209,7 +219,7 @@ class REPLSession:
             console.print("[yellow]No frontend service detected.[/yellow]")
             return
 
-        await self._start_all_services(list(frontend_parts.keys()))
+        await self._start_all_services(list(frontend_parts.keys()), use_dashboard=False)
         self._services_running = True
         console.print("[green]Frontend started.[/green]\n")
 
@@ -224,7 +234,7 @@ class REPLSession:
             console.print("[yellow]No backend service detected.[/yellow]")
             return
 
-        await self._start_all_services(list(backend_parts.keys()))
+        await self._start_all_services(list(backend_parts.keys()), use_dashboard=False)
         self._services_running = True
         console.print("[green]Backend started.[/green]\n")
 
@@ -266,6 +276,11 @@ class REPLSession:
             except Exception:
                 pass
         self._log_file_handles.clear()
+
+        # Stop dashboard
+        if self._dashboard:
+            self._dashboard.stop()
+            self._dashboard = None
 
         self._services_running = False
         console.print("[dim]All services stopped.[/dim]\n")
@@ -447,59 +462,56 @@ class REPLSession:
         console.print("[green]Setup complete![/green]\n")
 
     async def _setup_api_key(self) -> None:
-        """Interactive API key setup with provider selection."""
+        """Interactive API key setup for Gemini."""
         from agent.session import save_global_api_key
 
         console.print("[cyan]API Key Setup[/cyan]\n")
+        console.print("  Get your key at: [blue]https://aistudio.google.com/app/apikey[/blue]\n")
 
-        # Ask provider first
-        provider_choice = console.input(
-            "Which provider? ([bold]minimax[/bold] or [bold]gemini[/bold]): "
-        ).strip().lower()
-
-        if provider_choice not in ("minimax", "gemini"):
-            console.print("[red]Invalid choice. Must be 'minimax' or 'gemini'. Skipping.[/red]\n")
-            return
-
-        # Show provider-specific instructions
-        if provider_choice == "minimax":
-            console.print("  Get your key at: [blue]https://www.minimaxi.com/[/blue]\n")
-            key_label = "MiniMax API key"
-        else:
-            console.print("  Get your key at: [blue]https://aistudio.google.com/app/apikey[/blue]\n")
-            key_label = "Gemini API key"
-
-        key = console.input(f"Enter your {key_label}: ").strip()
+        key = console.input("Enter your Gemini API key: ").strip()
         if not key:
             console.print("[red]API key cannot be empty.[/red]\n")
             return
 
-        save_global_api_key(key.strip(), provider=provider_choice)
+        save_global_api_key(key.strip(), provider="gemini")
         self._api_key = key.strip()
-        self._provider = provider_choice
-        console.print(f"[green]API key saved![/green] ({provider_choice})\n")
+        self._provider = "gemini"
+        console.print("[green]API key saved![/green] (gemini-2.5-flash ready)\n")
 
     # ── Service Management ────────────────────────────────────────────────────
 
-    async def _start_all_services(self, service_names: list[str]) -> None:
+    async def _start_all_services(self, service_names: list[str], use_dashboard: bool = True) -> None:
         """Start services by name and begin monitoring."""
         parts = {k: v for k, v in self._parts.items() if k in service_names}
         if not parts:
             return
 
         # Setup monitoring
+        from config import load as load_config
+        cfg = load_config()
+        trigger_cfg = cfg.get("triggers", {})
+        rate_cfg = trigger_cfg.get("rate_spike", {})
+        crit_cfg = trigger_cfg.get("critical_keyword", {})
+        jsonl_cfg = cfg.get("output", {}).get("jsonl", {})
+
         self._buffer = RingBuffer(maxlen=500)
         self._engine = TriggerEngine(
             rules=[
                 NewErrorTypeRule(),
-                RateSpikeRule(threshold=3, window_seconds=10),
-                CriticalKeywordRule(),
+                RateSpikeRule(
+                    threshold=rate_cfg.get("threshold", 3),
+                    window_seconds=rate_cfg.get("window_seconds", 10),
+                ),
+                CriticalKeywordRule(extra_keywords=crit_cfg.get("extra_keywords", [])),
                 HttpErrorRule(),
+                MetricThresholdRule(),
+                ClusterFormationRule(),
+                SilenceAnomalyRule(),
             ],
             cooldowns=CooldownTracker(),
             agent_queue=asyncio.Queue(maxsize=50),
         )
-        self._agent = MiniMaxAgent(api_key=self._api_key)
+        self._agent = GeminiAgent(api_key=self._api_key)
         self._windows_notifier = WindowsNotifier()
 
         tg_cfg = get_telegram_config()
@@ -515,6 +527,9 @@ class REPLSession:
         async def on_finding(finding: dict[str, Any]) -> None:
             self._finding_count[0] += 1
             source = finding.get("source", "unknown")
+            if self._dashboard:
+                self._dashboard.add_alert(finding)
+                self._dashboard.increment_errors(source)
             if self._windows_notifier:
                 try:
                     self._windows_notifier.notify(finding)
@@ -522,7 +537,16 @@ class REPLSession:
                     pass
             if self._telegram_notifier:
                 try:
-                    self._telegram_notifier.notify(finding, project=get_project_name())
+                    await self._telegram_notifier.notify(finding, project=get_project_name())
+                except Exception:
+                    pass
+            # Write alert to JSONL log
+            if jsonl_cfg.get("enabled", True):
+                try:
+                    jsonl_path = Path(jsonl_cfg.get("path", ".logwhisper/alerts.jsonl"))
+                    jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+                    with open(jsonl_path, "a", encoding="utf-8") as jf:
+                        jf.write(json.dumps(finding) + "\n")
                 except Exception:
                     pass
             print_alert(finding, suppressed_count=self._engine.suppression_count)
@@ -534,6 +558,15 @@ class REPLSession:
             lf = open(info["log_path"], "a", encoding="utf-8", errors="replace")
             self._log_file_handles[name] = lf
 
+        # Check and install dependencies BEFORE spawning services
+        await self._check_and_install_deps(parts)
+
+        # Optionally start the dashboard (lives above the log stream)
+        self._dashboard: Dashboard | None = None
+        if use_dashboard:
+            self._dashboard = Dashboard(service_names=list(parts.keys()))
+            self._dashboard.start()
+
         # Spawn subprocesses
         for name, info in parts.items():
             lf = self._log_file_handles.get(name)
@@ -544,9 +577,13 @@ class REPLSession:
                     stderr=asyncio.subprocess.STDOUT,
                 )
                 self._processes[name] = proc
+                if self._dashboard:
+                    self._dashboard.set_running(name)
                 console.print(f"[green]Started {name}[/green] (PID {proc.pid})")
             except Exception as exc:
                 console.print(f"[red]Failed to start {name}:[/red] {exc}")
+                if self._dashboard:
+                    self._dashboard.set_error(name)
 
         console.print()
 
@@ -601,7 +638,11 @@ class REPLSession:
             if not clean:
                 continue
 
+            # Print to terminal AND update dashboard simultaneously
             print_service_log(name, clean)
+            if self._dashboard:
+                self._dashboard.append_log(name, clean)
+                self._dashboard.increment_lines(name)
 
             if log_file:
                 log_file.write(clean + "\n")
@@ -632,7 +673,7 @@ class REPLSession:
     async def _agent_worker(
         self,
         queue: asyncio.Queue[dict[str, Any]],
-        agent: MiniMaxAgent,
+        agent: GeminiAgent,
         on_finding: Any,
     ) -> None:
         """Consume agent queue, call LLM, invoke on_finding."""
@@ -649,9 +690,74 @@ class REPLSession:
                 await on_finding(finding)
             except Exception as exc:
                 import logging
-                logging.getLogger("logwhisper").error("Agent worker error: %s", exc)
+                logging.getLogger("logwhisper").error("%s worker error: %s", "Nexus", exc)
             finally:
                 queue.task_done()
+
+    # ── Dependency Check ────────────────────────────────────────────────────
+
+    async def _check_and_install_deps(self, parts: dict[str, dict]) -> None:
+        """Check deps for all services, prompt or auto-install if missing."""
+        from rich.prompt import Confirm
+
+        services_needing_deps: list[tuple[str, Path]] = []
+        for name, info in parts.items():
+            service_path = Path(info["path"])
+            result = check_service_deps(name, service_path)
+            if result.missing:
+                services_needing_deps.append((name, service_path))
+
+        if not services_needing_deps:
+            return
+
+        console.print()
+        console.print(
+            f"[yellow]⚠ Dependencies may be missing for {len(services_needing_deps)} service(s).[/yellow]"
+        )
+        for name, path in services_needing_deps:
+            console.print(f"  [cyan]{name}[/cyan]  ({path})")
+
+        try:
+            answer = Confirm.ask("\nDependencies missing. Install now? (y/N)")
+        except (KeyboardInterrupt, EOFError):
+            console.print("\n[dim]Skipping install.[/dim]")
+            return
+
+        if answer:
+            await self._run_install(services_needing_deps)
+
+    async def _run_install(self, services_needing_deps: list[tuple[str, Path]]) -> None:
+        """Run install for each service."""
+        import subprocess
+
+        for name, path in services_needing_deps:
+            result = check_service_deps(name, path)
+            if result.manager == "unknown":
+                console.print(f"[dim]  {name}: no recognized package manager, skipping[/dim]")
+                continue
+
+            console.print(f"  [cyan]{name}[/cyan]  installing via {result.manager}...")
+
+            install_cmd = result.install_command()
+            try:
+                proc = subprocess.run(
+                    install_cmd,
+                    cwd=str(path),
+                    capture_output=True,
+                    text=True,
+                    timeout=300,
+                    shell=True,
+                )
+                if proc.returncode == 0:
+                    console.print(f"    [green]✓ {name} installed[/green]")
+                else:
+                    console.print(f"    [red]✗ {name} install failed[/red]")
+                    if proc.stderr:
+                        console.print(f"      [dim]{proc.stderr[:200]}[/dim]")
+            except subprocess.TimeoutExpired:
+                console.print(f"    [red]✗ {name} install timed out[/red]")
+            except FileNotFoundError:
+                console.print(f"    [red]✗ {result.manager} not found — is it installed?[/red]")
 
     # ── UI Helpers ──────────────────────────────────────────────────────────
 
@@ -683,7 +789,7 @@ class REPLSession:
         )
 
         status_lines = []
-        status_lines.append("[bold white]Welcome back![/bold white]")
+        status_lines.append("[bold white]🔷 NEXUS — Online[/bold white]")
         status_lines.append("")
         status_lines.append("LogWhisper v0.1.0")
         status_lines.append(key_status)

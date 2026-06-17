@@ -5,6 +5,7 @@
 *.key
 secrets/
 keys/
+.claude/
 
 # Python
 __pycache__/

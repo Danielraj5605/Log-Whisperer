@@ -47,9 +47,9 @@ _LEVEL_MAP: dict[str, str] = {
     "VERBOSE": "DEBUG",
 }
 
-# Regex to find level keyword at start of log line
+# Regex to find level keyword anywhere in the log line (word-boundary aware)
 _LEVEL_PATTERN = re.compile(
-    r"^\[?(DEBUG|INFO|WARN(?:ING)?|ERROR|ERR|CRIT(?:ICAL)?|FATAL|TRACE|VERBOSE)\]?\s*",
+    r"\b(DEBUG|INFO|WARN(?:ING)?|ERROR|ERR|CRIT(?:ICAL)?|FATAL|TRACE|VERBOSE)\b",
     re.IGNORECASE,
 )
 
@@ -131,8 +131,8 @@ def parse(line: str, source: str = "unknown", adapter: str = "file") -> dict:
     Returns:
         Normalized log object dict.
     """
-    # Extract level
-    level_match = _LEVEL_PATTERN.match(line)
+    # Extract level — search the full line (not just the start)
+    level_match = _LEVEL_PATTERN.search(line)
     if level_match:
         level = _normalize_level(level_match.group(1))
     else:

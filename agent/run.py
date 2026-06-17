@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 import subprocess
 import sys
@@ -14,22 +15,28 @@ from rich.panel import Panel
 from rich.columns import Columns
 from rich.text import Text
 
-from agent.agent import MiniMaxAgent
+from agent.agent import GeminiAgent
 from agent.detect import detect_project_parts, detect_project_type, get_project_name
+from agent.deps import check_service_deps
 from agent.session import ensure_api_key, get_api_key, get_telegram_config
 from buffer.parser import parse
 from buffer.ring_buffer import RingBuffer
 from ingest.file_adapter import FileAdapter
-from output.terminal import (
-    ServiceStatusPanel,
-    print_alert,
-    print_service_log,
-)
+from output.dashboard import Dashboard
 from output.telegram_notification import TelegramNotifier
+from output.terminal import print_alert
 from output.windows_notification import WindowsNotifier
 from trigger.cooldown import CooldownTracker
 from trigger.engine import TriggerEngine
-from trigger.rules import CriticalKeywordRule, HttpErrorRule, NewErrorTypeRule, RateSpikeRule
+from trigger.rules import (
+    CriticalKeywordRule,
+    HttpErrorRule,
+    MetricThresholdRule,
+    ClusterFormationRule,
+    SilenceAnomalyRule,
+    NewErrorTypeRule,
+    RateSpikeRule,
+)
 
 console = Console()
 
@@ -39,11 +46,8 @@ _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
 
 
 
-async def run() -> None:
-    """Main run flow: detect all project parts → spawn all services → monitor logs."""
-    # --- API Key ---
-    existing_key = get_api_key()
-    api_key = ensure_api_key(existing_key)
+async def run(auto_install: bool = False, skip_deps_check: bool = False) -> None:
+    """Main run flow: detect all project parts → check deps → spawn all services → monitor logs."""
 
     # --- Project Detection ---
     parts = detect_project_parts()
@@ -67,24 +71,48 @@ async def run() -> None:
         log_dir = Path(info["log_path"]).parent
         log_dir.mkdir(parents=True, exist_ok=True)
 
+    # --- API Key ---
+    existing_key = get_api_key()
+    api_key = ensure_api_key(existing_key)
+
     # --- Print startup header ---
     _print_header(parts)
 
+    # --- Dependency check ---
+    if not skip_deps_check:
+        _check_and_install_deps(parts, auto_install, console)
+
+    # --- Create and start dashboard ---
+    dashboard = Dashboard(service_names)
+    dashboard.start()
+
     # --- Setup Monitoring ---
+    from config import load as load_config
+    cfg = load_config()
+    trigger_cfg = cfg.get("triggers", {})
+    rate_cfg = trigger_cfg.get("rate_spike", {})
+    crit_cfg = trigger_cfg.get("critical_keyword", {})
+
     buffer = RingBuffer(maxlen=500)
     cooldowns = CooldownTracker()
     agent_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=50)
     engine = TriggerEngine(
         rules=[
             NewErrorTypeRule(),
-            RateSpikeRule(threshold=3, window_seconds=10),
-            CriticalKeywordRule(),
+            RateSpikeRule(
+                threshold=rate_cfg.get("threshold", 3),
+                window_seconds=rate_cfg.get("window_seconds", 10),
+            ),
+            CriticalKeywordRule(extra_keywords=crit_cfg.get("extra_keywords", [])),
             HttpErrorRule(),
+            MetricThresholdRule(),
+            ClusterFormationRule(),
+            SilenceAnomalyRule(),
         ],
         cooldowns=cooldowns,
         agent_queue=agent_queue,
     )
-    agent = MiniMaxAgent(api_key=api_key)
+    agent = GeminiAgent(api_key=api_key)
     windows_notifier = WindowsNotifier()
 
     # Telegram notifier — only if configured
@@ -96,15 +124,15 @@ async def run() -> None:
             chat_id=telegram_config["chat_id"],
         )
 
-    finding_count = [0]
+    jsonl_cfg = cfg.get("output", {}).get("jsonl", {})
 
-    # --- Service status tracker ---
-    status_panel = ServiceStatusPanel(service_names)
+    finding_count = [0]
 
     async def on_finding(finding: dict[str, Any]) -> None:
         finding_count[0] += 1
         source = finding.get("source", "unknown")
-        status_panel.increment_errors(source)
+        dashboard.add_alert(finding)
+        dashboard.increment_errors(source)
 
         try:
             windows_notifier.notify(finding)
@@ -114,10 +142,21 @@ async def run() -> None:
 
         if telegram_notifier:
             try:
-                telegram_notifier.notify(finding, project=get_project_name())
+                await telegram_notifier.notify(finding, project=get_project_name())
             except Exception as exc:
                 import logging
                 logging.getLogger("logwhisper").warning("Telegram notification failed: %s", exc)
+
+        # Write alert to JSONL log
+        if jsonl_cfg.get("enabled", True):
+            try:
+                jsonl_path = Path(jsonl_cfg.get("path", ".logwhisper/alerts.jsonl"))
+                jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(jsonl_path, "a", encoding="utf-8") as jf:
+                    jf.write(json.dumps(finding) + "\n")
+            except Exception as exc:
+                import logging
+                logging.getLogger("logwhisper").warning("JSONL write failed: %s", exc)
 
         print_alert(finding, suppressed_count=engine.suppression_count)
 
@@ -137,14 +176,13 @@ async def run() -> None:
                 stderr=asyncio.subprocess.STDOUT,
             )
             processes[name] = proc
-            status_panel.set_running(name)
+            dashboard.set_running(name)
             console.print(f"[green]Started {name}[/green] (PID {proc.pid})")
         except Exception as exc:
             console.print(f"[red]Failed to start {name}: {exc}[/red]")
-            status_panel.set_error(name)
+            dashboard.set_error(name)
 
     console.print()
-    console.print(status_panel.render())
     console.print()
 
     # --- Per-service: read output → tee to file + print with [SERVICE] tag ---
@@ -169,13 +207,12 @@ async def run() -> None:
             if not clean:
                 continue
 
-            print_service_log(name, clean)
+            dashboard.append_log(name, clean)
+            dashboard.increment_lines(name)
 
             if log_file:
                 log_file.write(clean + "\n")
                 log_file.flush()
-
-            status_panel.increment_lines(name)
 
             # Feed to trigger engine immediately so errors are caught live
             log_obj = parse(clean, source=name, adapter="subprocess")
@@ -183,7 +220,7 @@ async def run() -> None:
             engine.evaluate(log_obj, buffer)
             buffer.push(log_obj)
 
-        status_panel.set_stopped(name)
+        dashboard.set_stopped(name)
 
     # --- Per-service: tail log file → feed to trigger engine ---
     async def monitor_service(name: str, log_path: str) -> None:
@@ -248,7 +285,78 @@ async def run() -> None:
                 lf.close()
             except Exception:
                 pass
+        dashboard.stop()
         console.print("[dim]Goodbye![/dim]")
+
+
+def _check_and_install_deps(parts: dict[str, dict], auto_install: bool, console: Console) -> None:
+    """Check dependencies for all services, prompt or auto-install if missing."""
+    import subprocess
+    from rich.prompt import Confirm
+
+    services_needing_deps: list[tuple[str, Path]] = []
+    for name, info in parts.items():
+        service_path = Path(info["path"])
+        result = check_service_deps(name, service_path)
+        if result.missing:
+            services_needing_deps.append((name, service_path))
+
+    if not services_needing_deps:
+        return
+
+    console.print()
+    console.print(
+        f"[yellow]⚠ Dependencies may be missing for {len(services_needing_deps)} service(s).[/yellow]"
+    )
+    for name, path in services_needing_deps:
+        console.print(f"  [cyan]{name}[/cyan]  ({path})")
+
+    if auto_install:
+        console.print("\n[cyan]Auto-installing dependencies...[/cyan]")
+        _run_install(services_needing_deps, console)
+        return
+
+    try:
+        answer = Confirm.ask("\nDependencies missing. Install now? (y/N)")
+    except (KeyboardInterrupt, EOFError):
+        console.print("\n[dim]Skipping install.[/dim]")
+        return
+
+    if answer:
+        _run_install(services_needing_deps, console)
+
+
+def _run_install(services_needing_deps: list[tuple[str, Path]], console: Console) -> None:
+    """Run install for each service."""
+    for name, path in services_needing_deps:
+        from agent.deps import check_service_deps
+
+        result = check_service_deps(name, path)
+        if result.manager == "unknown":
+            console.print(f"[dim]  {name}: no recognized package manager, skipping[/dim]")
+            continue
+
+        console.print(f"  [cyan]{name}[/cyan]  installing via {result.manager}...")
+
+        install_cmd = result.install_command()
+        try:
+            proc = subprocess.run(
+                install_cmd,
+                cwd=str(path),
+                capture_output=True,
+                text=True,
+                timeout=300,
+            )
+            if proc.returncode == 0:
+                console.print(f"    [green]✓ {name} installed[/green]")
+            else:
+                console.print(f"    [red]✗ {name} install failed[/red]")
+                if proc.stderr:
+                    console.print(f"      [dim]{proc.stderr[:200]}[/dim]")
+        except subprocess.TimeoutExpired:
+            console.print(f"    [red]✗ {name} install timed out[/red]")
+        except FileNotFoundError:
+            console.print(f"    [red]✗ {result.manager} not found — is it installed?[/red]")
 
 
 def _print_header(parts: dict[str, dict]) -> None:
@@ -335,11 +443,12 @@ async def _prompt_for_services() -> dict[str, dict]:
 
 async def _agent_worker(
     queue: asyncio.Queue[dict[str, Any]],
-    agent: MiniMaxAgent,
+    agent: GeminiAgent,
     on_finding: Any,
     finding_count_ref: list[int],
 ) -> None:
     """Background worker — consume trigger queue, call agent, invoke on_finding."""
+    from agent.agent import AGENT_NAME
     while True:
         try:
             trigger_event = await asyncio.wait_for(queue.get(), timeout=5.0)

@@ -1,4 +1,4 @@
-"""Chat agent — conversational LLM interface for error analysis and project Q&A."""
+"""Chat agent — conversational Gemini interface for error analysis and project Q&A."""
 
 from __future__ import annotations
 
@@ -25,6 +25,9 @@ Guidelines:
 - If something is unclear, say so rather than guessing
 - Use simple language, avoid jargon unless the user uses it first
 """
+
+GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
+GEMINI_DEFAULT_MODEL = "gemini-2.5-flash"
 
 
 def get_project_context() -> dict[str, Any]:
@@ -104,97 +107,49 @@ def _format_chat_context(context: dict[str, Any], log_lines: list[str], error: s
 
 
 class ChatAgent:
-    """Conversational LLM agent — supports MiniMax and Google Gemini."""
-
-    PROVIDER_DEFAULTS = {
-        "minimax": {
-            "model": "MiniMax-Text-01",
-            "base_url": "https://api.minimaxi.com/v1",
-            "endpoint": "/text/chatcompletion_v2",
-        },
-        "gemini": {
-            "model": "gemini-2.5-flash",
-            "base_url": "https://generativelanguage.googleapis.com/v1beta",
-            "endpoint": "generateContent",
-        },
-    }
+    """Conversational LLM agent using Google Gemini."""
 
     def __init__(
         self,
         api_key: str | None = None,
-        provider: str = "minimax",
+        provider: str = "gemini",   # kept for API compatibility, always Gemini
         model: str | None = None,
         base_url: str | None = None,
     ) -> None:
-        defaults = self.PROVIDER_DEFAULTS.get(provider, self.PROVIDER_DEFAULTS["minimax"])
-
-        self.provider = provider
-        self.api_key = api_key or self._resolve_api_key(provider)
-        self.model = model or defaults["model"]
-        self.base_url = (base_url or defaults["base_url"]).rstrip("/")
-        self.endpoint = defaults["endpoint"]
-
-    def _resolve_api_key(self, provider: str) -> str:
-        """Resolve API key from environment variables based on provider."""
-        if provider == "gemini":
-            key = os.environ.get("GEMINI_API_KEY", "").strip()
-            if key:
-                return key
-        # Fall back to MINIMAX_API_KEY for minimax and as general fallback
-        return os.environ.get("MINIMAX_API_KEY", "").strip()
-
-    def _build_payload(self, messages: list[dict]) -> dict[str, Any]:
-        """Build provider-specific request payload."""
-        if self.provider == "gemini":
-            # Gemini: uses contents format instead of messages
-            contents = []
-            for msg in messages:
-                role = "model" if msg["role"] == "assistant" else "user"
-                contents.append({"role": role, "parts": [{"text": msg["content"]}]})
-            return {
-                "contents": contents,
-                "generationConfig": {"maxOutputTokens": 800, "temperature": 0.4},
-            }
-        # MiniMax / OpenAI-compatible
-        return {
-            "model": self.model,
-            "messages": messages,
-            "max_tokens": 800,
-            "temperature": 0.4,
-        }
-
-    def _build_headers(self) -> dict[str, str]:
-        """Build provider-specific headers."""
-        if self.provider == "gemini":
-            return {"Content-Type": "application/json"}
-        return {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
+        self.provider = "gemini"
+        self.api_key = api_key or os.environ.get("GEMINI_API_KEY", "")
+        self.model = model or GEMINI_DEFAULT_MODEL
+        self.base_url = (base_url or GEMINI_BASE_URL).rstrip("/")
 
     def _build_url(self) -> str:
-        """Build the full request URL."""
-        if self.provider == "gemini":
-            return f"{self.base_url}/models/{self.model}:{self.endpoint}?key={self.api_key}"
-        return f"{self.base_url}{self.endpoint}"
+        return f"{self.base_url}/models/{self.model}:generateContent?key={self.api_key}"
+
+    def _build_payload(self, messages: list[dict]) -> dict[str, Any]:
+        """Convert message list to Gemini contents format."""
+        # Extract system message if present
+        system_text = ""
+        chat_messages = []
+        for msg in messages:
+            if msg["role"] == "system":
+                system_text = msg["content"]
+            else:
+                role = "model" if msg["role"] == "assistant" else "user"
+                chat_messages.append({"role": role, "parts": [{"text": msg["content"]}]})
+
+        payload: dict[str, Any] = {
+            "contents": chat_messages,
+            "generationConfig": {"maxOutputTokens": 800, "temperature": 0.4},
+        }
+        if system_text:
+            payload["system_instruction"] = {"parts": [{"text": system_text}]}
+        return payload
 
     def _parse_response(self, data: dict) -> str:
-        """Extract text from provider response."""
-        if self.provider == "gemini":
-            try:
-                return data["candidates"][0]["content"]["parts"][0]["text"]
-            except (KeyError, IndexError):
-                return "Error: Could not parse Gemini response."
-        # MiniMax / OpenAI-compatible
+        """Extract text from Gemini response."""
         try:
-            # MiniMax uses choices[0].messages[0].content (not message.content)
-            choices = data.get("choices", [])
-            if choices:
-                msg = choices[0].get("messages", [])
-                if msg:
-                    return msg[0].get("content", "")
-                # OpenAI-compatible fallback
-                return choices[0].get("message", {}).get("content", "")
-            return "Error: No choices in response."
+            return data["candidates"][0]["content"]["parts"][0]["text"]
         except (KeyError, IndexError):
-            return "Error: Could not parse LLM response."
+            return "Error: Could not parse Gemini response."
 
     async def ask(
         self,
@@ -207,15 +162,15 @@ class ChatAgent:
         fallback_provider: str = "gemini",
     ) -> str:
         """
-        Send a conversational question to the LLM and return the response text.
+        Send a conversational question to Gemini and return the response text.
 
         Args:
             question: The user's question or request
             error: Optional error log to analyze
             log_lines: Optional list of recent log lines for context
             project_context: Optional project context (from get_project_context)
-            fallback_key: API key to use if primary fails (e.g. gemini key when minimax fails)
-            fallback_provider: Provider name for the fallback key
+            fallback_key: Unused — kept for API compatibility
+            fallback_provider: Unused — kept for API compatibility
 
         Returns:
             The LLM's response as a plain string.
@@ -239,98 +194,31 @@ USER QUESTION:
             {"role": "user", "content": user_content},
         ]
 
-        headers = self._build_headers()
         payload = self._build_payload(messages)
-
-        timeout = 30.0
-        error_detail = None
-
-        for attempt in range(3):
-            try:
-                async with httpx.AsyncClient(timeout=timeout) as client:
-                    url = self._build_url()
-                    response = await client.post(url, headers=headers, json=payload)
-                    if response.status_code == 429:
-                        wait = 2 ** attempt
-                        await asyncio.sleep(wait)
-                        continue
-                    response.raise_for_status()
-                    data = response.json()
-                    # MiniMax returns errors as HTTP 200 with base_resp.status_code
-                    if self.provider == "minimax" and data.get("base_resp", {}).get("status_code") not in (0, 200, "0", "200"):
-                        status_code = data["base_resp"]["status_code"]
-                        status_msg = data["base_resp"].get("status_msg", "unknown error")
-                        if status_code in (2049,):
-                            raise Exception(f"MiniMax auth error: {status_msg} (code {status_code})")
-                        raise Exception(f"MiniMax error: {status_msg} (code {status_code})")
-            except httpx.TimeoutException:
-                if attempt == 2:
-                    error_detail = "Chat request timed out after 30 seconds."
-            except httpx.HTTPStatusError as exc:
-                # If primary fails with auth/server error, try fallback immediately
-                if fallback_key and exc.response.status_code in (401, 403, 500, 502, 503, 504):
-                    return await self._try_fallback(
-                        messages=messages,
-                        fallback_key=fallback_key,
-                        fallback_provider=fallback_provider,
-                    )
-                if attempt == 2:
-                    error_detail = f"Chat request failed: {exc}"
-                await asyncio.sleep(2 ** attempt)
-            except Exception as exc:
-                if attempt == 2:
-                    error_detail = f"Chat request failed: {exc}"
-                await asyncio.sleep(2 ** attempt)
-        else:
-            # All retries exhausted — try fallback if available
-            if fallback_key:
-                return await self._try_fallback(
-                    messages=messages,
-                    fallback_key=fallback_key,
-                    fallback_provider=fallback_provider,
-                )
-            return f"Error: {error_detail}" if error_detail else "Error: Chat request failed after 3 retries."
-
-        return self._parse_response(data)
-
-    async def _try_fallback(
-        self,
-        messages: list[dict],
-        fallback_key: str,
-        fallback_provider: str,
-    ) -> str:
-        """Attempt the same request with the fallback provider."""
-        from agent.session import get_fallback_key_and_provider
-
-        # Build a temporary ChatAgent with fallback credentials
-        fallback_defaults = self.PROVIDER_DEFAULTS.get(fallback_provider, self.PROVIDER_DEFAULTS["minimax"])
-        fallback_agent = ChatAgent(
-            api_key=fallback_key,
-            provider=fallback_provider,
-            model=fallback_defaults["model"],
-            base_url=fallback_defaults["base_url"],
-        )
-
-        headers = fallback_agent._build_headers()
-        payload = fallback_agent._build_payload(messages)
+        error_detail: str | None = None
 
         for attempt in range(3):
             try:
                 async with httpx.AsyncClient(timeout=30.0) as client:
-                    url = fallback_agent._build_url()
-                    response = await client.post(url, headers=headers, json=payload)
+                    url = self._build_url()
+                    response = await client.post(url, json=payload)
                     if response.status_code == 429:
                         await asyncio.sleep(2 ** attempt)
                         continue
                     response.raise_for_status()
                     data = response.json()
-                    result = fallback_agent._parse_response(data)
-                    if result.startswith("Error:"):
-                        raise Exception(result)
-                    return result
-            except Exception:
-                if attempt == 2:
-                    return "Error: Both primary and fallback providers failed. Check your API keys."
-                await asyncio.sleep(2 ** attempt)
+                    return self._parse_response(data)
+            except httpx.TimeoutException:
+                error_detail = "Chat request timed out after 30 seconds."
+                if attempt < 2:
+                    await asyncio.sleep(2 ** attempt)
+            except httpx.HTTPStatusError as exc:
+                error_detail = f"Chat request failed: HTTP {exc.response.status_code}"
+                if attempt < 2:
+                    await asyncio.sleep(2 ** attempt)
+            except Exception as exc:
+                error_detail = f"Chat request failed: {exc}"
+                if attempt < 2:
+                    await asyncio.sleep(2 ** attempt)
 
-        return "Error: Fallback provider also failed after 3 retries."
+        return f"Error: {error_detail}" if error_detail else "Error: Chat request failed after 3 retries."

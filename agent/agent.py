@@ -1,4 +1,4 @@
-"""AI agent — assembles context, calls LLM, returns structured finding."""
+"""AI agent — assembles context, calls Gemini LLM, returns structured finding."""
 
 from __future__ import annotations
 
@@ -11,8 +11,12 @@ from typing import Any
 
 import httpx
 
+AGENT_NAME = "Nexus"
 
 logger = logging.getLogger(__name__)
+
+GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
+GEMINI_DEFAULT_MODEL = "gemini-2.5-flash"
 
 SYSTEM_PROMPT = """You are Log Whisperer, a live log analysis AI agent embedded in a developer's terminal.
 
@@ -72,6 +76,10 @@ Analyze this situation and return your finding as JSON."""
 def _parse_finding(raw_text: str) -> dict[str, Any]:
     """Extract JSON from LLM response text."""
     text = raw_text.strip()
+    # Strip markdown code fences if present
+    if text.startswith("```"):
+        text = "\n".join(text.split("\n")[1:])
+        text = text.rstrip("`").strip()
     # Try to find JSON block
     start = text.find("{")
     end = text.rfind("}") + 1
@@ -93,50 +101,64 @@ def _parse_finding(raw_text: str) -> dict[str, Any]:
     }
 
 
-class MiniMaxAgent:
-    """LLM agent using MiniMax's OpenAI-compatible API."""
+class GeminiAgent:
+    """LLM agent using Google Gemini API via httpx."""
 
     def __init__(
         self,
         api_key: str | None = None,
-        model: str = "MiniMax-Text-01",
-        base_url: str = "https://api.minimax.chat/v1",
+        model: str = GEMINI_DEFAULT_MODEL,
+        base_url: str = GEMINI_BASE_URL,
     ) -> None:
-        self.api_key = api_key or os.environ.get("MINIMAX_API_KEY", "")
+        # Read key from GEMINI_API_KEY env var
+        self.api_key = api_key or os.environ.get("GEMINI_API_KEY", "")
         self.model = model
         self.base_url = base_url.rstrip("/")
 
+    def _build_url(self) -> str:
+        return f"{self.base_url}/models/{self.model}:generateContent?key={self.api_key}"
+
+    def _build_payload(self, user_content: str) -> dict[str, Any]:
+        return {
+            "system_instruction": {
+                "parts": [{"text": SYSTEM_PROMPT}]
+            },
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [{"text": user_content}],
+                }
+            ],
+            "generationConfig": {
+                "maxOutputTokens": 1000,
+                "temperature": 0.3,
+            },
+        }
+
+    def _parse_response(self, data: dict[str, Any]) -> str:
+        try:
+            return data["candidates"][0]["content"]["parts"][0]["text"]
+        except (KeyError, IndexError):
+            return ""
+
     async def analyze(self, trigger_event: dict[str, Any]) -> dict[str, Any]:
-        """Send trigger event to MiniMax LLM and return structured finding."""
+        """Send trigger event to Gemini LLM and return structured finding."""
         start = time.time()
         user_content = _format_context(trigger_event)
 
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-        }
-
-        payload = {
-            "model": self.model,
-            "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_content},
-            ],
-            "max_tokens": 1000,
-            "temperature": 0.3,
-        }
+        url = self._build_url()
+        payload = self._build_payload(user_content)
 
         timeout = 30.0
+        last_error: str = "Unknown error"
+
         for attempt in range(3):
             try:
                 async with httpx.AsyncClient(timeout=timeout) as client:
-                    response = await client.post(
-                        f"{self.base_url}/chat/completions",
-                        headers=headers,
-                        json=payload,
-                    )
+                    response = await client.post(url, json=payload)
                     if response.status_code == 429:
                         wait = 2 ** attempt
+                        logger.warning("Gemini rate-limited, retrying in %ss", wait)
                         await asyncio.sleep(wait)
                         continue
                     response.raise_for_status()
@@ -147,17 +169,17 @@ class MiniMaxAgent:
                     return _make_timeout_finding(trigger_event)
                 await asyncio.sleep(2 ** attempt)
             except Exception as exc:
-                logger.error("LLM call failed: %s", exc)
+                last_error = str(exc)
+                logger.error("Gemini LLM call failed (attempt %d): %s", attempt + 1, exc)
                 if attempt == 2:
-                    return _make_error_finding(trigger_event, str(exc))
+                    return _make_error_finding(trigger_event, last_error)
                 await asyncio.sleep(2 ** attempt)
         else:
             return _make_error_finding(trigger_event, "Max retries exceeded")
 
-        try:
-            content = data["choices"][0]["message"]["content"]
-        except (KeyError, IndexError):
-            return _make_error_finding(trigger_event, "Unexpected response format")
+        content = self._parse_response(data)
+        if not content:
+            return _make_error_finding(trigger_event, "Unexpected Gemini response format")
 
         finding = _parse_finding(content)
         elapsed_ms = int((time.time() - start) * 1000)
@@ -170,6 +192,13 @@ class MiniMaxAgent:
         return finding
 
 
+# Backwards-compatible alias — existing code referencing MiniMaxAgent continues to work
+MiniMaxAgent = GeminiAgent
+
+
+# ── Fallback finding factories ─────────────────────────────────────────────────
+
+
 def _make_timeout_finding(trigger_event: dict[str, Any]) -> dict[str, Any]:
     return {
         "alert_id": f"LW-{time.strftime('%Y%m%d-%H%M%S')}",
@@ -178,11 +207,11 @@ def _make_timeout_finding(trigger_event: dict[str, Any]) -> dict[str, Any]:
         "trigger": trigger_event["rule"],
         "confidence": "low",
         "root_signal": trigger_event["log_obj"]["raw"][:200],
-        "caused_by": "LLM call timed out after 30s",
+        "caused_by": "Gemini LLM call timed out after 30s",
         "contributing_factors": [],
         "blast_radius": "unknown",
         "evidence": [],
-        "action": "Check LLM service availability",
+        "action": "Check Gemini API availability or increase timeout",
         "kb_used": False,
         "latency_ms": 30000,
         "suppressed_count": 0,
@@ -201,7 +230,7 @@ def _make_error_finding(trigger_event: dict[str, Any], error: str) -> dict[str, 
         "contributing_factors": [],
         "blast_radius": "unknown",
         "evidence": [],
-        "action": "Check MiniMax API key and service status",
+        "action": "Check GEMINI_API_KEY env var and Gemini service status",
         "kb_used": False,
         "latency_ms": 0,
         "suppressed_count": 0,

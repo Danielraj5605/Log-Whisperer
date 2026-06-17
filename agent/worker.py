@@ -8,10 +8,12 @@ from typing import Any, Callable, Coroutine
 
 logger = logging.getLogger(__name__)
 
+AGENT_NAME = "Nexus"
+
 
 async def agent_worker(
     queue: asyncio.Queue[dict[str, Any]],
-    agent,  # MiniMaxAgent or similar
+    agent,  # GeminiAgent or similar
     on_finding: Callable[[dict[str, Any]], Coroutine[Any, Any, None]],
     suppressed_ref: list[int],
 ) -> None:
@@ -38,6 +40,6 @@ async def agent_worker(
             finding["suppressed_count"] = suppressed_ref[0]
             await on_finding(finding)
         except Exception as exc:
-            logger.error("Agent worker error: %s", exc)
+            logger.error("%s worker error: %s", AGENT_NAME, exc)
         finally:
             queue.task_done()

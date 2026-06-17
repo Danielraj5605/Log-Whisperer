@@ -159,3 +159,29 @@ def ensure_logs_dir() -> Path:
     logs_dir = Path.cwd() / "logs"
     logs_dir.mkdir(exist_ok=True)
     return logs_dir
+
+
+def detect_package_manager(path: Path) -> tuple[str, str | None]:
+    """Detect package manager and return (manager, dep_file).
+
+    Checks for lock files in order:
+      - package-lock.json  → npm
+      - yarn.lock         → yarn
+      - pnpm-lock.yaml    → pnpm
+
+    Returns (manager, dep_file) or ("pip", "requirements.txt") for Python,
+    or ("unknown", None) if nothing detected.
+    """
+    if (path / "package-lock.json").exists():
+        return ("npm", None)
+    if (path / "yarn.lock").exists():
+        return ("yarn", None)
+    if (path / "pnpm-lock.yaml").exists():
+        return ("pnpm", None)
+
+    if (path / "requirements.txt").exists():
+        return ("pip", "requirements.txt")
+    if (path / "pyproject.toml").exists():
+        return ("pip", "pyproject.toml")
+
+    return ("unknown", None)

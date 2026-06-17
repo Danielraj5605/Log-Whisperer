@@ -11,9 +11,9 @@ import yaml
 
 DEFAULT_CONFIG = {
     "llm": {
-        "provider": "minimax",
-        "model": "MiniMax-Text-01",
-        "api_key": os.environ.get("MINIMAX_API_KEY", ""),
+        "provider": "gemini",
+        "model": "gemini-2.5-flash",
+        "api_key": os.environ.get("GEMINI_API_KEY", ""),
         "max_tokens": 1000,
         "timeout_seconds": 30,
     },
@@ -30,6 +30,7 @@ DEFAULT_CONFIG = {
         "windows_notification": True,
     },
     "watch": {"default_files": []},
+    "deps": {"auto_install": False, "skip_check": False},
 }
 
 

@@ -22,9 +22,9 @@ class TelegramNotifier:
     def enabled(self) -> bool:
         return self._enabled
 
-    def notify(self, finding: dict[str, Any], project: str = "") -> bool:
+    async def notify(self, finding: dict[str, Any], project: str = "") -> bool:
         """
-        Send an alert to the configured Telegram chat.
+        Send an alert to the configured Telegram chat (async, non-blocking).
 
         Returns True if sent successfully, False otherwise.
         """
@@ -42,18 +42,23 @@ class TelegramNotifier:
         }
 
         try:
-            response = httpx.post(url, json=payload, timeout=10.0)
-            response.raise_for_status()
-            return True
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                response = await client.post(url, json=payload)
+                response.raise_for_status()
+                return True
         except httpx.HTTPStatusError as exc:
-            logger.error("Telegram HTTP error: %s — %s", exc.response.status_code, exc.response.text)
+            logger.error(
+                "Telegram HTTP error: %s — %s",
+                exc.response.status_code,
+                exc.response.text,
+            )
             return False
         except Exception as exc:
             logger.error("Telegram notification failed: %s", exc)
             return False
 
     def send_text(self, text: str) -> bool:
-        """Send a plain text message (for test messages)."""
+        """Send a plain text message synchronously (used only in setup/test commands)."""
         if not self._enabled:
             return False
 

@@ -18,6 +18,7 @@ class FileAdapter:
         path: str | Path,
         poll_ms: int = 100,
         source: str | None = None,
+        from_beginning: bool = False,
     ) -> None:
         self._path = Path(path)
         self._poll_ms = poll_ms
@@ -25,6 +26,7 @@ class FileAdapter:
         self._pos = 0
         self._inode: int | None = None
         self._running = False
+        self._from_beginning = from_beginning
 
     def _get_inode(self) -> int | None:
         try:
@@ -46,7 +48,7 @@ class FileAdapter:
         self._inode = inode
 
         f = open(self._path, "r", encoding="utf-8", errors="replace")
-        if self._pos == 0:
+        if self._pos == 0 and not self._from_beginning:
             # Seek to end on first open (don't replay old logs)
             f.seek(0, os.SEEK_END)
             self._pos = f.tell()

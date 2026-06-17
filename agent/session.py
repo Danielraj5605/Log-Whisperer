@@ -32,13 +32,13 @@ def get_global_api_key() -> tuple[str | None, str | None]:
         try:
             with open(creds_path, encoding="utf-8") as f:
                 data = json.load(f)
-            return data.get("api_key", ""), data.get("provider", "minimax")
+            return data.get("api_key", ""), data.get("provider", "gemini")
         except (json.JSONDecodeError, OSError):
             pass
-    return None, "minimax"
+    return None, "gemini"
 
 
-def save_global_api_key(api_key: str, provider: str = "minimax") -> None:
+def save_global_api_key(api_key: str, provider: str = "gemini") -> None:
     """Save API key and provider to global config directory (securely)."""
     config_dir = get_global_config_dir()
     config_dir.mkdir(parents=True, exist_ok=True)
@@ -70,48 +70,34 @@ def save_global_api_key(api_key: str, provider: str = "minimax") -> None:
 def get_api_key_and_provider() -> tuple[str | None, str | None]:
     """Get API key and its detected provider from env or config.
 
-    Returns (api_key, provider) — provider is 'minimax', 'gemini', or 'unknown'.
-    Priority: env vars > saved config > project config.
+    Returns (api_key, provider) — provider is 'gemini' or 'unknown'.
+    Priority: GEMINI_API_KEY env > saved config > project config.
     """
-    # 1. Environment variables (highest priority)
-    minimax_key = os.environ.get("MINIMAX_API_KEY", "").strip()
+    # 1. Environment variable (highest priority)
     gemini_key = os.environ.get("GEMINI_API_KEY", "").strip()
-
-    if minimax_key and gemini_key:
-        return minimax_key, "minimax"
-    if minimax_key:
-        return minimax_key, "minimax"
     if gemini_key:
         return gemini_key, "gemini"
 
-    # 2. Global credentials file (check provider too)
+    # 2. Global credentials file
     global_key, saved_provider = get_global_api_key()
     if global_key:
-        return global_key, saved_provider or "minimax"
+        return global_key, saved_provider or "gemini"
 
-    # 3. Project .logwhisper.yaml (legacy support — always minimax)
+    # 3. Project .logwhisper.yaml
     project_key = get_project_api_key()
     if project_key:
-        return project_key, "minimax"
+        return project_key, "gemini"
 
     return None, "unknown"
 
 
 def get_fallback_key_and_provider() -> tuple[str | None, str | None]:
-    """Get the fallback API key and provider (for when primary fails).
+    """Get the fallback API key and provider (kept for API compatibility).
 
-    For dual-key setup: primary is minimax, fallback is gemini (stored as gemini_api_key).
-    Priority: env vars > saved config.
+    Since we are now Gemini-only, there is no separate fallback key.
+    Returns (None, 'unknown') unless a second key is stored in credentials.
     """
-    # Check env vars first
-    gemini_key = os.environ.get("GEMINI_API_KEY", "").strip()
-    minimax_key = os.environ.get("MINIMAX_API_KEY", "").strip()
-
-    # If minimax is primary and gemini exists, gemini is fallback
-    if minimax_key and gemini_key:
-        return gemini_key, "gemini"
-
-    # Check credentials file for stored gemini key
+    # Check credentials file for an explicit gemini_api_key secondary slot
     creds_path = get_global_credentials_path()
     if creds_path.exists():
         try:
@@ -152,7 +138,7 @@ def get_project_api_key() -> str | None:
 
 
 def prompt_api_key() -> str:
-    """Prompt user for API key and save globally."""
+    """Prompt user for a Gemini API key and save globally."""
     from rich.console import Console
     from rich.prompt import Prompt
 
@@ -160,12 +146,12 @@ def prompt_api_key() -> str:
     console.print("\n[cyan]No API key found.[/cyan]")
     console.print("Run [green]logwhisper setup[/green] to configure your API key once.\n")
 
-    key = Prompt.ask("Enter your MiniMax API key", password=True)
+    key = Prompt.ask("Enter your Gemini API key", password=True)
 
     if not key.strip():
         raise ValueError("API key cannot be empty")
 
-    save_global_api_key(key.strip(), provider="minimax")
+    save_global_api_key(key.strip(), provider="gemini")
     console.print("[green]API key saved![/green]\n")
     return key.strip()
 
