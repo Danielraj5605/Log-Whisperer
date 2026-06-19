@@ -114,8 +114,31 @@ if errorlevel 1 (
 echo  [OK] All dependencies installed.
 echo.
 
-:: ── Step 5: Run guided setup ─────────────────────────────────
-echo  [5/5] Running first-time configuration...
+:: ── Step 5: Install globally so the command works everywhere ──
+echo  [5/6] Installing logwhisper command globally (no activation needed)...
+
+:: Deactivate venv temporarily to install into user Python
+call deactivate 2>nul
+python -m pip install -e . --user --quiet
+if errorlevel 1 (
+    echo  [WARN] Global install failed. You will need to run .venv\Scripts\activate
+    echo         before using logwhisper in new terminals.
+    goto :skip_path_fix
+)
+
+echo  [OK] Global install complete.
+
+:: Add Python user Scripts to PATH if not already there
+echo  Adding Python Scripts folder to your PATH...
+for /f "delims=" %%p in ('python -c "import sys, os; print(os.path.join(os.environ.get('APPDATA',''), 'Python', 'Python%d%d' %% (sys.version_info.major, sys.version_info.minor), 'Scripts'))"') do set USERSCRIPTS=%%p
+
+powershell -Command "$cur = [System.Environment]::GetEnvironmentVariable('PATH','User'); if ($cur -notlike '*%USERSCRIPTS%*') { [System.Environment]::SetEnvironmentVariable('PATH', $cur + ';%USERSCRIPTS%', 'User'); Write-Host '  [OK] Added to PATH: %USERSCRIPTS%' } else { Write-Host '  [OK] Already on PATH.' }"
+
+:skip_path_fix
+echo.
+
+:: ── Step 6: Run guided setup ─────────────────────────────────
+echo  [6/6] Running first-time configuration...
 echo.
 echo  You will be asked for your Gemini API key.
 echo  Get one for free at: https://aistudio.google.com/app/apikey
@@ -127,11 +150,10 @@ echo.
 :: ── Done ─────────────────────────────────────────────────────
 echo.
 echo  =====================================================
-echo   Setup complete! Here's how to use Log Whisperer:
+echo   Setup complete!
 echo  =====================================================
 echo.
-echo  Activate the environment (do this each new terminal):
-echo    .venv\Scripts\activate
+echo  logwhisper is now available from any terminal.
 echo.
 echo  Watch a log file for anomalies:
 echo    logwhisper watch --file .\test.log
@@ -141,6 +163,9 @@ echo    logwhisper chat
 echo.
 echo  Full monitoring mode (auto-detect project):
 echo    logwhisper run
+echo.
+echo  If a command is ever not found, run once:
+echo    .venv\Scripts\activate
 echo.
 echo  =====================================================
 echo.
