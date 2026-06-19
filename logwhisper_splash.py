@@ -129,9 +129,9 @@ def show_splash(
 if __name__ == "__main__":
     # Demo mode — shows placeholder data
     show_splash(
-        api_key="AQ.Ab8RN6IUk_demo",
+        api_key="sk-demo-key-replace-with-real",
         provider="gemini",
-        cwd="~/EdgeCraft",
+        cwd="~/my-project",
         parts={
             "frontend": {"command": "npm run dev"},
             "backend": {"command": "uvicorn main:app"},
