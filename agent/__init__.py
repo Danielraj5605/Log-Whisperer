@@ -529,6 +529,16 @@ def setup(
     Configures your API key and Telegram alerts interactively.
     Run this once after installing Log Whisperer.
     """
+    # ── Python version guard ───────────────────────────────────────────
+    import sys as _sys
+    if _sys.version_info < (3, 11):
+        typer.echo(
+            f"\n[ERROR] Log Whisperer requires Python 3.11 or newer.\n"
+            f"  You are running Python {_sys.version_info.major}.{_sys.version_info.minor}.\n"
+            f"  Download the latest Python from: https://www.python.org/downloads/\n"
+        )
+        raise typer.Exit(1)
+
     from rich.console import Console
     from rich.panel import Panel
     from rich.rule import Rule

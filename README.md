@@ -2,74 +2,92 @@
 
 **AI-Powered Live Log Intelligence Agent** — watches your log streams in real-time and fires structured, evidence-backed anomaly alerts using an LLM.
 
-Unlike traditional log monitoring tools that match static rules, Log Whisperer reasons about what is actually happening: root cause, blast radius, and what to do right now.
+Unlike traditional log monitoring tools that match static rules, Log Whisperer *reasons* about what is actually happening: root cause, blast radius, and what to do right now.
 
 ---
 
 ## Features
 
-- **Live log tailing** — file, Docker containers, Kubernetes pods, or stdin pipe
-- **AI-powered analysis** — MiniMax / Claude / GPT-4o / Ollama
+- **Live log tailing** — file, Docker containers, or stdin pipe
+- **AI-powered analysis** — Gemini / Claude / GPT-4o / Ollama
 - **Windows toast notifications** — get alerted even when the terminal is minimized
 - **Rich terminal UI** — color-coded alerts with evidence, action, and blast radius
 - **Smart triggering** — only wakes the LLM when something is actually wrong (not every log line)
-- **Cooldown suppression** — 200 identical errors = 1 alert with suppressed count
-- **Local-first** — no cloud infra required, just an LLM API call
+- **Cooldown suppression** — 200 identical errors = 1 alert with a suppressed count
+- **Local-first** — no cloud infra required, just a Gemini API key
 
 ---
 
 ## Requirements
 
 - Python 3.11+
-- Windows (for toast notifications via `winotify`)
-- MiniMax API key (or OpenAI/Anthropic/Ollama)
+- A free [Gemini API key](https://aistudio.google.com/app/apikey)
+- Windows, macOS, or Linux
+
+> **Note:** Windows toast notifications require the `winotify` package (installed automatically). On macOS/Linux, notifications are terminal-only.
 
 ---
 
-## Installation
+## Quick Setup (Recommended)
 
-### 1. Clone / navigate to the project
+### Windows
 
-```bash
-cd "D:\Personal Projects\Log Whisperer"
+```bat
+git clone https://github.com/your-username/log-whisperer.git
+cd log-whisperer
+setup.bat
 ```
 
-### 2. Create a virtual environment
+`setup.bat` will automatically:
+1. Verify Python 3.11+ is installed
+2. Create a virtual environment (`.venv`)
+3. Install all dependencies
+4. Run the interactive `logwhisper setup` wizard
+
+### macOS / Linux
 
 ```bash
+git clone https://github.com/your-username/log-whisperer.git
+cd log-whisperer
+chmod +x setup.sh
+./setup.sh
+```
+
+Same steps as above — just double-run `source .venv/bin/activate` in each new terminal session before using `logwhisper`.
+
+---
+
+## Manual Setup (Advanced)
+
+If you prefer to set things up yourself:
+
+```bash
+# 1. Create and activate a virtual environment
 python -m venv .venv
-.venv\Scripts\activate   # Windows
-# source .venv/bin/activate  # macOS / Linux
-```
 
-### 3. Install dependencies
+# Windows
+.venv\Scripts\activate
+# macOS / Linux
+source .venv/bin/activate
 
-```bash
-pip install rich typer PyYAML python-dateutil winotify httpx
-```
+# 2. Install Log Whisperer and all dependencies
+pip install -e .
 
-### 4. Set up Log Whisperer
-
-**One-time guided setup (recommended):**
-```bash
+# 3. Run the guided first-time setup
 logwhisper setup
 ```
 
-This interactive command will:
-- Ask for your MiniMax API key (with a link to get one)
-- Ask if you want to enable Telegram alerts (with step-by-step instructions)
-- Validate everything and print a summary
+### Setting your API key without the wizard
 
-**Or set the API key directly:**
 ```bash
 # Windows
-set MINIMAX_API_KEY=your_minimax_api_key_here
+set GEMINI_API_KEY=your_gemini_api_key_here
 
 # macOS / Linux
-export MINIMAX_API_KEY=your_minimax_api_key_here
+export GEMINI_API_KEY=your_gemini_api_key_here
 ```
 
-**Pass it to a command:**
+Or pass it directly to a command:
 ```bash
 logwhisper watch --file ./test.log --api-key your_key_here
 ```
@@ -87,19 +105,19 @@ logwhisper watch --file ./test.log
 ### Watch multiple files
 
 ```bash
-python cli.py watch --file ./logs/app.log --file ./logs/auth.log
+logwhisper watch --file ./logs/app.log --file ./logs/auth.log
 ```
 
-### Watch with custom trigger threshold
+### Watch with a custom trigger threshold
 
 ```bash
-python cli.py watch --file ./logs/app.log --buffer 1000
+logwhisper watch --file ./logs/app.log --buffer 1000
 ```
 
 ### Run without Windows notifications
 
 ```bash
-python cli.py watch --file ./logs/app.log --no-notification
+logwhisper watch --file ./logs/app.log --no-notification
 ```
 
 ---
@@ -151,8 +169,8 @@ logwhisper watch [OPTIONS]
 | `--file`, `-f` | — | Log file(s) to tail |
 | `--poll` | 100 | File polling interval (ms) |
 | `--buffer`, `-b` | 500 | Ring buffer max lines |
-| `--model` | MiniMax-Text-01 | LLM model name |
-| `--api-key` | env/MINIMAX_API_KEY | API key |
+| `--model` | gemini-2.5-flash | LLM model name |
+| `--api-key` | env/GEMINI_API_KEY | Gemini API key |
 | `--no-notification` | false | Disable Windows toast |
 | `--no-telegram` | false | Disable Telegram alerts |
 
@@ -164,6 +182,14 @@ logwhisper analyze --file ./logs/incident.log
 
 > Batch analysis is planned — currently use `watch` for live analysis.
 
+### `telegram` — Manage Telegram alerts
+
+```bash
+logwhisper telegram status   # Show current config
+logwhisper telegram test     # Send a test message
+logwhisper telegram clear    # Remove Telegram config
+```
+
 ---
 
 ## Configuration
@@ -172,9 +198,9 @@ Create a `.logwhisper.yaml` in your project root:
 
 ```yaml
 llm:
-  provider: minimax          # minimax | anthropic | openai | ollama
-  model: MiniMax-Text-01
-  api_key: ${MINIMAX_API_KEY}
+  provider: gemini
+  model: gemini-2.5-flash
+  api_key: ${GEMINI_API_KEY}
   max_tokens: 1000
   timeout_seconds: 30
 
@@ -205,9 +231,25 @@ output:
 ## Project Structure
 
 ```
-logwhisper/
-├── cli.py                     # Typer CLI — entry point
+log-whisperer/
+├── setup.bat                  # One-click Windows setup
+├── setup.sh                   # One-click macOS/Linux setup
+├── .env.example               # Environment variable template
+├── requirements.txt           # Pip fallback dependency list
+├── pyproject.toml             # Package metadata & entry points
 ├── config.py                  # .logwhisper.yaml loader
+│
+├── agent/
+│   ├── __init__.py            # Typer CLI — entry point
+│   ├── agent.py               # Gemini LLM integration
+│   ├── chat.py                # Interactive chat agent
+│   ├── deps.py                # Dependency checker
+│   ├── detect.py              # Project type detection
+│   ├── repl.py                # Interactive REPL session
+│   ├── run.py                 # Auto-detect & run session
+│   ├── session.py             # API key & config management
+│   ├── shell.py               # Shell command runner
+│   └── worker.py              # Background agent worker
 │
 ├── buffer/
 │   ├── parser.py              # Raw log → normalized log object
@@ -221,13 +263,11 @@ logwhisper/
 │   ├── rules.py               # 6 trigger rule types
 │   └── cooldown.py            # Per-(rule, source) cooldown tracker
 │
-├── agent/
-│   ├── agent.py               # MiniMax LLM integration
-│   └── worker.py              # Background async agent worker
-│
 └── output/
     ├── terminal.py            # Rich-formatted alert display
-    └── windows_notification.py # Windows toast notifications
+    ├── dashboard.py           # Live status dashboard
+    ├── telegram_notification.py # Telegram alerts
+    └── windows_notification.py  # Windows toast notifications
 ```
 
 ---
@@ -279,8 +319,8 @@ Plus a Windows toast notification with the same info.
 ## Supported LLM Providers
 
 ```bash
-# MiniMax (default)
-logwhisper watch --file ./logs/app.log --model MiniMax-Text-01
+# Gemini (default)
+logwhisper watch --file ./logs/app.log --model gemini-2.5-flash
 
 # OpenAI GPT-4o
 logwhisper watch --file ./logs/app.log --model gpt-4o
@@ -296,24 +336,65 @@ logwhisper watch --file ./logs/app.log --model llama3
 
 ## Troubleshooting
 
-### "No module named 'X'"
+### ❌ `'logwhisper' is not recognized as a command`
+
+The CLI entry point is only available after running `pip install -e .` inside your virtual environment. Just re-run `setup.bat` (or `setup.sh`) — it handles this automatically.
+
+Alternatively:
 ```bash
-pip install rich typer PyYAML python-dateutil winotify httpx
+.venv\Scripts\activate     # Windows
+pip install -e .
 ```
 
-### "No API key provided"
+### ❌ `No module named 'X'`
+
+Your virtual environment may not be activated. Activate it first:
 ```bash
-set MINIMAX_API_KEY=your_key_here
-logwhisper watch --file ./logs/app.log
+# Windows
+.venv\Scripts\activate
+
+# macOS / Linux
+source .venv/bin/activate
+```
+Then retry your command.
+
+### ❌ `No API key provided`
+
+Either run the setup wizard:
+```bash
+logwhisper setup
 ```
 
-### Toast notifications not showing
+Or set the environment variable:
+```bash
+# Windows
+set GEMINI_API_KEY=your_key_here
+
+# macOS / Linux
+export GEMINI_API_KEY=your_key_here
+```
+
+Get a free Gemini API key at: https://aistudio.google.com/app/apikey
+
+### ❌ Python version error
+
+Log Whisperer requires **Python 3.11 or newer**. Check your version:
+```bash
+python --version
+```
+
+Download the latest Python from: https://www.python.org/downloads/
+
+### ❌ Toast notifications not showing
+
 - Make sure `winotify` is installed: `pip install winotify`
-- Check Windows notification settings for your account
+- Check Windows notification settings → ensure notifications are enabled for your terminal app
 
-### File not being tailed
+### ❌ File not being tailed
+
 - Ensure the file path exists and is readable
 - Try `--poll 500` if the file is written slowly
+- Use an absolute path if a relative path isn't being resolved correctly
 
 ---
 

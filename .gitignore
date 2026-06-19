@@ -1,11 +1,17 @@
 # Environment and secrets
 .env
 .env.*
+!.env.example
 *.pem
 *.key
 secrets/
 keys/
 .claude/
+
+# Virtual environment
+.venv/
+venv/
+env/
 
 # Python
 __pycache__/
