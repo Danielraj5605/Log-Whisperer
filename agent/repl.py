@@ -17,6 +17,8 @@ from rich.rule import Rule
 from rich.table import Table
 from rich.text import Text
 
+from logwhisper_splash import show_splash
+
 from agent.agent import GeminiAgent
 from agent.chat import ChatAgent, get_project_context
 from agent.detect import detect_project_parts, detect_project_type, get_project_name
@@ -297,11 +299,35 @@ class REPLSession:
 
         console.print("[dim]Thinking...[/dim]")
 
-        # Gather recent log lines from running services
+        # ── Build service status block ─────────────────────────────────────
+        service_status_lines: list[str] = []
+        if self._processes:
+            service_status_lines.append("[RUNNING SERVICES]")
+            for name, proc in self._processes.items():
+                alive = proc.returncode is None
+                status = "running" if alive else f"stopped (exit {proc.returncode})"
+                info = self._parts.get(name, {})
+                cmd = info.get("command", "unknown")
+                service_status_lines.append(f"  {name}: {status}  (cmd: {cmd})")
+            service_status_lines.append("")
+        else:
+            service_status_lines.append("[NO SERVICES RUNNING — user has not run /run yet]")
+            service_status_lines.append("")
+
+        # ── Gather ALL buffered log lines (not just recent window) ─────────
         log_lines: list[str] = []
-        if self._buffer:
-            for entry in self._buffer.window(seconds=120)[-50:]:
-                log_lines.append(f"[{entry.get('level', 'INFO')}] {entry.get('raw', '')}")
+        if self._buffer and len(self._buffer) > 0:
+            # Pull everything in the buffer (up to 100 lines)
+            all_entries = list(self._buffer._buf)[-100:]
+            for entry in all_entries:
+                source = entry.get("source", "")
+                level = entry.get("level", "INFO")
+                raw = entry.get("raw", "")
+                if raw:
+                    log_lines.append(f"[{source}] [{level}] {raw}")
+
+        # Prepend service status to log lines so the AI always sees it
+        combined_context = service_status_lines + (log_lines if log_lines else ["[No log lines captured yet]"])
 
         # Get fallback key for auto-failover
         fallback_key, fallback_provider = get_fallback_key_and_provider()
@@ -310,7 +336,7 @@ class REPLSession:
             agent = ChatAgent(api_key=self._api_key, provider=self._provider)
             response = await agent.ask(
                 message,
-                log_lines=log_lines,
+                log_lines=combined_context,
                 fallback_key=fallback_key,
                 fallback_provider=fallback_provider,
             )
@@ -324,12 +350,43 @@ class REPLSession:
         console.print("[dim]" + ("-" * 60) + "[/dim]")
 
     async def _cmd_watch(self, args: str) -> None:
-        """Watch a log file — wraps the watch command."""
+        """Watch a log file, or stream the live service buffer if no file given."""
         if not args:
-            console.print("[dim]Usage: /watch ./logs/app.log[/dim]")
+            # No file given — if services are running, replay buffer then stream live
+            if self._processes and self._buffer:
+                console.print("[dim]Streaming live service logs (Ctrl+C to stop):[/dim]\n")
+                # First, replay everything already in the buffer
+                for entry in list(self._buffer._buf):
+                    source = entry.get("source", "")
+                    raw = _ANSI_RE.sub("", entry.get("raw", ""))
+                    if raw:
+                        console.print(f"[dim][{source}][/dim] {raw}")
+                # Then tail new lines as they arrive (buffer is fed by background tasks)
+                seen = len(self._buffer)
+                console.print("[dim]--- live ---[/dim]")
+                try:
+                    while True:
+                        await asyncio.sleep(0.2)
+                        current = list(self._buffer._buf)
+                        if len(current) > seen:
+                            for entry in current[seen:]:
+                                source = entry.get("source", "")
+                                raw = _ANSI_RE.sub("", entry.get("raw", ""))
+                                if raw:
+                                    console.print(f"[dim][{source}][/dim] {raw}")
+                            seen = len(current)
+                except asyncio.CancelledError:
+                    pass
+                except KeyboardInterrupt:
+                    pass
+                console.print("[dim]Stopped watching.[/dim]\n")
+            else:
+                console.print("[dim]No services running. Usage:[/dim]")
+                console.print("  /watch ./logs/app.log   -- tail a log file")
+                console.print("  /run                    -- start services (then /watch shows live logs)")
             return
 
-        # Parse simple --file argument
+        # File path given — tail that file
         file_path = args.strip()
         if file_path.startswith("--file"):
             file_path = file_path.replace("--file", "").strip()
@@ -346,7 +403,6 @@ class REPLSession:
         console.print(f"[dim]Watching:[/dim] {file_path}")
         console.print("[dim]Press Ctrl+C to stop watching.[/dim]\n")
 
-        # Run a simple file tail
         adapter = FileAdapter(path=p, poll_ms=100)
         try:
             async for log_obj in adapter.stream():
@@ -764,66 +820,18 @@ class REPLSession:
     def _print_banner(self) -> None:
         import os
 
-        avatar_lines = [
-            "   _________  ",
-            "  |         | ",
-            "  |  O   O  | ",
-            "  |    o    | ",
-            "  |   ___   | ",
-            "  |_________| ",
-        ]
-
-        cwd = os.getcwd()
-
-        if self._api_key:
-            key_status = "[green]API Key Active[/green]"
-            key_display = f"{self._api_key[:12]}... [{self._provider}]"
-        else:
-            key_status = "[red]Not configured[/red]"
-            key_display = "Run /setup to configure"
-
-        avatar_panel = Panel(
-            Text("\n".join(avatar_lines), style="bold cyan"),
-            border_style="cyan",
-            padding=(1, 1),
+        show_splash(
+            console=console,
+            api_key=self._api_key,
+            provider=self._provider,
+            cwd=os.getcwd(),
+            parts=self._parts if self._parts else None,
         )
 
-        status_lines = []
-        status_lines.append("[bold white]🔷 NEXUS — Online[/bold white]")
-        status_lines.append("")
-        status_lines.append("LogWhisper v0.1.0")
-        status_lines.append(key_status)
-        if self._api_key:
-            status_lines.append(f"[dim]{key_display}[/dim]")
-        status_lines.append("")
-        status_lines.append(f"[dim]{cwd}[/dim]")
-
-        status_panel = Panel(
-            Text("\n".join(status_lines)),
-            border_style="cyan",
-            padding=(1, 2),
-        )
-
-        from rich.columns import Columns
-        banner_content = Columns([avatar_panel, status_panel], expand=True)
-
+        console.print("  [cyan]/help[/cyan]   Show all commands")
+        console.print("  [cyan]/run[/cyan]    Start monitoring all services")
+        console.print("  [cyan]/chat[/cyan]   Ask the AI about your logs")
         console.print()
-        console.print(banner_content)
-        console.print()
-
-        if self._parts:
-            console.print("[green]Project:[/green] " + str(len(self._parts)) + " service(s) detected")
-            for name, info in self._parts.items():
-                console.print("  [cyan]" + name + "[/cyan]  " + info["command"])
-            console.print()
-        else:
-            console.print("[yellow]Project:[/yellow] No project detected")
-            console.print("  Use [cyan]/run-frontend[/cyan] or [cyan]/run-backend[/cyan] to start manually.\n")
-
-        console.print("[bold]Usage[/bold]\n")
-        console.print("  [cyan]/help[/cyan]     Show all commands")
-        console.print("  [cyan]/run[/cyan]     Start monitoring all services")
-        console.print("  [cyan]/chat <msg>[/cyan]  Ask about logs\n")
 
     def _print_service_status(self) -> None:
         if not self._processes:
