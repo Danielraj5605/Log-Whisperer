@@ -49,6 +49,12 @@ console = Console()
 # ANSI strip pattern (from run.py)
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
 
+# Detect localhost URLs printed by dev servers (handles IPv4, IPv6, 0.0.0.0)
+_URL_RE = re.compile(
+    r"(https?://(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::(?:1)?\])(?::\d{1,5})?(?:/\S*)?)",
+    re.IGNORECASE,
+)
+
 
 # ─── Help text ────────────────────────────────────────────────────────────────
 
@@ -196,6 +202,9 @@ class REPLSession:
             self._print_service_status()
             return
 
+        # Re-detect every time so we always pick up the latest detect.py output
+        # (including the 'url' field added to each service entry).
+        self._parts = detect_project_parts()
         if not self._parts:
             console.print("[yellow]No project detected. Use /run-frontend or /run-backend manually.[/yellow]")
             return
@@ -208,7 +217,24 @@ class REPLSession:
         await self._start_all_services(list(self._parts.keys()), use_dashboard=False)
         self._services_running = True
         console.print("[green]All services started.[/green]")
-        console.print("[dim]Use /stop to stop them, or /chat to ask about errors.[/dim]\n")
+        console.print("[dim]Use /stop to stop them, or /chat to ask about errors.[/dim]")
+
+        # Print URLs for every service that has one — always shown, regardless of server output
+        urls_to_show = [(name, info["url"]) for name, info in self._parts.items() if info.get("url")]
+        if urls_to_show:
+            console.print()
+            for name, url in urls_to_show:
+                console.print(
+                    Panel(
+                        f"[bold green]\U0001f310  {name}[/bold green]\n\n"
+                        f"   [bold white underline]{url}[/bold white underline]"
+                        f"  [dim]← open in browser[/dim]",
+                        border_style="green",
+                        padding=(0, 2),
+                        expand=False,
+                    )
+                )
+        console.print()
 
     async def _cmd_run_frontend(self) -> None:
         """Start only the frontend service."""
@@ -636,6 +662,20 @@ class REPLSession:
                 if self._dashboard:
                     self._dashboard.set_running(name)
                 console.print(f"[green]Started {name}[/green] (PID {proc.pid})")
+
+                # Print the expected URL immediately — don't wait for server output
+                url = info.get("url")
+                if url:
+                    console.print(
+                        Panel(
+                            f"[bold green]\U0001f310  {name}[/bold green]\n\n"
+                            f"   Open [bold white underline]{url}[/bold white underline]"
+                            f"  [dim](server is starting...)[/dim]",
+                            border_style="green",
+                            padding=(0, 2),
+                            expand=False,
+                        )
+                    )
             except Exception as exc:
                 console.print(f"[red]Failed to start {name}:[/red] {exc}")
                 if self._dashboard:
@@ -676,6 +716,7 @@ class REPLSession:
         log_file: Any,
     ) -> None:
         """Read subprocess stdout, print, tee to file, feed to trigger engine."""
+        _announced: set[str] = set()   # avoid printing same URL twice per service
         while True:
             if proc.stdout is None:
                 break
@@ -703,6 +744,31 @@ class REPLSession:
             if log_file:
                 log_file.write(clean + "\n")
                 log_file.flush()
+
+            # --- Live URL detection: catch the real URL/port the server chose ---
+            url_match = _URL_RE.search(clean)
+            if url_match:
+                raw_url = url_match.group(1).rstrip("/")
+                # Normalise non-routable addresses to localhost
+                real_url = (
+                    raw_url
+                    .replace("0.0.0.0", "localhost")
+                    .replace("[::]" , "localhost")
+                    .replace("[::1]", "localhost")
+                )
+                if real_url not in _announced:
+                    _announced.add(real_url)
+                    console.print()
+                    console.print(
+                        Panel(
+                            f"[bold green]\U0001f310  {name}[/bold green]  is ready\n\n"
+                            f"   [bold white underline]{real_url}[/bold white underline]",
+                            border_style="bright_green",
+                            padding=(0, 2),
+                            expand=False,
+                        )
+                    )
+                    console.print()
 
             # Feed to trigger engine
             if self._buffer and self._engine:

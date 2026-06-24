@@ -43,6 +43,12 @@ console = Console()
 # ANSI escape code strip pattern (matches SGR and other common sequences)
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
 
+# Pattern to extract localhost / 0.0.0.0 URLs printed by dev servers
+_URL_RE = re.compile(
+    r"(https?://(?:localhost|127\.0\.0\.1|0\.0\.0\.0)(?::\d{1,5})?(?:/\S*)?)",
+    re.IGNORECASE,
+)
+
 
 
 
@@ -185,6 +191,9 @@ async def run(auto_install: bool = False, skip_deps_check: bool = False) -> None
     console.print()
     console.print()
 
+    # Track which services have already announced their URL (avoid spam)
+    _announced_urls: set[str] = set()
+
     # --- Per-service: read output → tee to file + print with [SERVICE] tag ---
     async def read_service_output(name: str, proc: asyncio.subprocess.Process) -> None:
         """Read subprocess output, display with [SERVICE] tag, tee to log file, feed to trigger."""
@@ -213,6 +222,27 @@ async def run(auto_install: bool = False, skip_deps_check: bool = False) -> None
             if log_file:
                 log_file.write(clean + "\n")
                 log_file.flush()
+
+            # --- Detect real URL from server output and announce it ---
+            url_match = _URL_RE.search(clean)
+            if url_match:
+                real_url = url_match.group(1).rstrip("/")
+                # Normalise 0.0.0.0 → localhost
+                real_url = real_url.replace("0.0.0.0", "localhost")
+                key = f"{name}:{real_url}"
+                if key not in _announced_urls:
+                    _announced_urls.add(key)
+                    console.print()
+                    console.print(
+                        Panel(
+                            f"[bold green]🌐  {name}[/bold green]  is ready\n\n"
+                            f"   [bold white underline]{real_url}[/bold white underline]",
+                            border_style="green",
+                            padding=(0, 2),
+                            expand=False,
+                        )
+                    )
+                    console.print()
 
             # Feed to trigger engine immediately so errors are caught live
             log_obj = parse(clean, source=name, adapter="subprocess")
@@ -409,6 +439,13 @@ def _print_header(parts: dict[str, dict]) -> None:
     for name, info in parts.items():
         console.print(f"  [cyan]{name}[/cyan]  {info['command']}")
         console.print(f"           logs: {info['log_path']}")
+        url = info.get("url")
+        if url:
+            console.print(
+                f"           [dim]expected url →[/dim] "
+                f"[bold cyan underline]{url}[/bold cyan underline]"
+                f"  [dim](will confirm when server starts)[/dim]"
+            )
     console.print()
 
 
