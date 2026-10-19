@@ -11,25 +11,29 @@ from typing import Any
 _TIMESTAMP_PATTERNS: list[tuple[str, re.Pattern]] = [
     (
         "iso8601_tz",
-        re.compile(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2}))"),
+        re.compile(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:[.,]\d+)?(?:Z|[+-]\d{2}:?\d{2}))"),
     ),
     (
         "iso8601",
-        re.compile(r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:[.,]\d+)?)"),
-    ),
-    (
-        "epoch_ms",
-        re.compile(r"(\d{13})"),
-    ),
-    (
-        "epoch_s",
-        re.compile(r"(\d{10}(?:\.\d+)?)"),
+        re.compile(r"(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?)"),
     ),
     (
         "common_log",
         re.compile(r"(\d{2}/[A-Za-z]{3}/\d{4}:\d{2}:\d{2}:\d{2} [+-]\d{4})"),
     ),
+    (
+        "epoch_ms",
+        re.compile(r"(?<![\d.])(\d{13})(?![\d])"),
+    ),
+    (
+        "epoch_s",
+        re.compile(r"(?<![\d.])(\d{10}(?:\.\d+)?)(?![\d])"),
+    ),
 ]
+
+# Plausible epoch range (2001-09-09 .. 2100-01-01) so random IDs aren't read as timestamps
+_EPOCH_MIN = 1_000_000_000
+_EPOCH_MAX = 4_102_444_800
 
 # Level normalization map
 _LEVEL_MAP: dict[str, str] = {
@@ -54,10 +58,23 @@ _LEVEL_PATTERN = re.compile(
 )
 
 # Metric key=value extraction (e.g. latency=2847ms cpu=92%)
-_METRIC_PATTERN = re.compile(
-    r"(\w+)=(?:(\d+(?:\.\d+)?)(ms|%|o)?|true|false)",
+_METRIC_PATTERN = re.compile(r"\b(\w+)=(\d+(?:\.\d+)?)(ms|%)?(?![\w.])")
+
+# HTTP error detection: a 4xx/5xx status code on a line that looks like an HTTP access/error line
+_HTTP_CONTEXT_RE = re.compile(
+    r"HTTP/\d|\b(?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\b|\bstatus(?:_code)?\b",
     re.IGNORECASE,
 )
+_HTTP_STATUS_RE = re.compile(r"(?<![\w.:/-])([45]\d\d)(?=\s|-|$|[,;)\"'])")
+
+# Numbers that are NOT 4xx/5xx status codes — collapsed when computing signatures
+_VARIABLE_NUMBER_RE = re.compile(r"\b(?![45]\d\d\b)\d+\b")
+_VARIABLE_HEX_RE = re.compile(r"\b0x[0-9a-fA-F]+\b|\b[0-9a-fA-F]{8,}\b")
+
+
+def is_http_error(raw: str) -> bool:
+    """True if the line looks like an HTTP log line carrying a 4xx/5xx status."""
+    return bool(_HTTP_CONTEXT_RE.search(raw) and _HTTP_STATUS_RE.search(raw))
 
 
 def _normalize_level(raw: str) -> str:
@@ -68,22 +85,29 @@ def _normalize_level(raw: str) -> str:
 def _parse_timestamp(line: str) -> datetime:
     for name, pattern in _TIMESTAMP_PATTERNS:
         m = pattern.search(line)
-        if m:
-            ts_str = m.group(1)
-            try:
-                if name == "iso8601_tz":
-                    return datetime.fromisoformat(ts_str.replace("Z", "+00:00")).astimezone(timezone.utc)
-                elif name == "iso8601":
-                    try:
-                        return datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S,%f").replace(tzinfo=timezone.utc)
-                    except ValueError:
-                        return datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S.%f").replace(tzinfo=timezone.utc)
-                elif name == "epoch_ms":
-                    return datetime.fromtimestamp(int(ts_str) / 1000, tz=timezone.utc)
-                elif name == "epoch_s":
-                    return datetime.fromtimestamp(float(ts_str), tz=timezone.utc)
-            except ValueError:
+        if not m:
+            continue
+        ts_str = m.group(1)
+        try:
+            if name == "iso8601_tz":
+                dt = datetime.fromisoformat(ts_str.replace(",", ".").replace("Z", "+00:00"))
+                return dt.astimezone(timezone.utc)
+            if name == "iso8601":
+                dt = datetime.fromisoformat(ts_str.replace(",", ".").replace(" ", "T"))
+                # Naive timestamps are assumed to be in the machine's local timezone
+                return dt.astimezone(timezone.utc)
+            if name == "common_log":
+                dt = datetime.strptime(ts_str, "%d/%b/%Y:%H:%M:%S %z")
+                return dt.astimezone(timezone.utc)
+            if name == "epoch_ms":
+                value = int(ts_str) / 1000
+            else:
+                value = float(ts_str)
+            if not (_EPOCH_MIN <= value <= _EPOCH_MAX):
                 continue
+            return datetime.fromtimestamp(value, tz=timezone.utc)
+        except (ValueError, OverflowError, OSError):
+            continue
     return datetime.now(timezone.utc)
 
 
@@ -91,22 +115,14 @@ def _extract_fields(line: str) -> dict[str, Any]:
     fields: dict[str, Any] = {}
     for m in _METRIC_PATTERN.finditer(line):
         key = m.group(1).lower()
-        raw_val = m.group(2) or m.group(4)
+        raw_val = m.group(2)
         unit = m.group(3)
-        if raw_val is None:
-            continue
-        try:
-            val = float(raw_val) if "." in raw_val else int(raw_val)
-        except ValueError:
-            val = raw_val
+        val: int | float = float(raw_val) if "." in raw_val else int(raw_val)
 
-        # Apply unit
         if unit == "ms":
-            key = key.rstrip("_") + "_ms"
-            fields[key] = val
+            fields[key.rstrip("_") + "_ms"] = val
         elif unit == "%":
-            key = key.rstrip("_") + "_pct"
-            fields[key] = val
+            fields[key.rstrip("_") + "_pct"] = val
         elif key in ("status", "code", "status_code"):
             fields["status"] = int(val)
         else:
@@ -115,8 +131,19 @@ def _extract_fields(line: str) -> dict[str, Any]:
 
 
 def _make_signature(level: str, raw: str) -> str:
-    prefix = f"{level.lower()}:{raw[:80]}"
-    return hashlib.sha1(prefix.encode()).hexdigest()[:8]
+    """Hash of the line with timestamps, IDs and counters stripped out.
+
+    Two occurrences of the "same" error (differing only in time, request id, pid, ...)
+    must share a signature, otherwise every line looks like a brand-new error type.
+    """
+    text = raw
+    for _, pattern in _TIMESTAMP_PATTERNS:
+        text = pattern.sub(" ", text)
+    text = _VARIABLE_HEX_RE.sub("#", text)
+    text = _VARIABLE_NUMBER_RE.sub("#", text)
+    text = " ".join(text.split())
+    prefix = f"{level.lower()}:{text[:100]}"
+    return hashlib.sha1(prefix.encode("utf-8", errors="replace")).hexdigest()[:8]
 
 
 def parse(line: str, source: str = "unknown", adapter: str = "file") -> dict:
@@ -126,33 +153,23 @@ def parse(line: str, source: str = "unknown", adapter: str = "file") -> dict:
     Args:
         line: Raw log line string.
         source: Source identifier (e.g., filename, container name).
-        adapter: Which adapter produced this line (file | docker | k8s | stdin).
+        adapter: Which adapter produced this line (file | docker | stdin | subprocess).
 
     Returns:
         Normalized log object dict.
     """
-    # Extract level — search the full line (not just the start)
     level_match = _LEVEL_PATTERN.search(line)
-    if level_match:
-        level = _normalize_level(level_match.group(1))
-    else:
-        level = "INFO"
+    level = _normalize_level(level_match.group(1)) if level_match else "INFO"
 
-    # Extract timestamp
     ts = _parse_timestamp(line)
-
-    # Extract fields
-    fields = _extract_fields(line)
-
-    # Signature
-    sig = _make_signature(level, line)
 
     return {
         "ts": ts.isoformat(),
+        "epoch": ts.timestamp(),
         "source": source,
         "level": level,
         "raw": line,
-        "fields": fields,
-        "signature": sig,
+        "fields": _extract_fields(line),
+        "signature": _make_signature(level, line),
         "adapter": adapter,
     }

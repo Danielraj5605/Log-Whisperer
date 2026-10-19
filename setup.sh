@@ -94,7 +94,7 @@ echo "  You will be asked for your Gemini API key."
 echo "  Get one for free at: https://aistudio.google.com/app/apikey"
 echo ""
 
-logwhisper setup
+python -m agent setup
 echo ""
 
 # ── Done ──────────────────────────────────────────────────────

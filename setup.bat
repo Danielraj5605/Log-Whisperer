@@ -15,7 +15,7 @@ echo  =====================================================
 echo.
 
 :: ── Step 1: Check Python ────────────────────────────────────
-echo  [1/5] Checking Python version...
+echo  [1/6] Checking Python version...
 
 python --version >nul 2>&1
 if errorlevel 1 (
@@ -59,7 +59,7 @@ echo  [OK] Python %PYVER% found.
 echo.
 
 :: ── Step 2: Create virtual environment ──────────────────────
-echo  [2/5] Creating virtual environment (.venv)...
+echo  [2/6] Creating virtual environment (.venv)...
 
 if exist ".venv" (
     echo  [OK] .venv already exists, skipping creation.
@@ -78,7 +78,7 @@ if exist ".venv" (
 echo.
 
 :: ── Step 3: Activate and upgrade pip ────────────────────────
-echo  [3/5] Activating virtual environment and upgrading pip...
+echo  [3/6] Activating virtual environment and upgrading pip...
 
 call .venv\Scripts\activate.bat
 if errorlevel 1 (
@@ -95,7 +95,7 @@ echo  [OK] pip is up to date.
 echo.
 
 :: ── Step 4: Install Log Whisperer and all dependencies ──────
-echo  [4/5] Installing Log Whisperer and dependencies...
+echo  [4/6] Installing Log Whisperer and dependencies...
 echo  (This may take a minute on first run)
 echo.
 
@@ -132,7 +132,7 @@ echo  [OK] Global install complete.
 echo  Adding Python Scripts folder to your PATH...
 for /f "delims=" %%p in ('python -c "import sys, os; print(os.path.join(os.environ.get('APPDATA',''), 'Python', 'Python%d%d' %% (sys.version_info.major, sys.version_info.minor), 'Scripts'))"') do set USERSCRIPTS=%%p
 
-powershell -Command "$cur = [System.Environment]::GetEnvironmentVariable('PATH','User'); if ($cur -notlike '*%USERSCRIPTS%*') { [System.Environment]::SetEnvironmentVariable('PATH', $cur + ';%USERSCRIPTS%', 'User'); Write-Host '  [OK] Added to PATH: %USERSCRIPTS%' } else { Write-Host '  [OK] Already on PATH.' }"
+powershell -Command "$cur = [System.Environment]::GetEnvironmentVariable('PATH','User'); if (-not $cur) { $cur = '' }; if ($cur -notlike '*%USERSCRIPTS%*') { [System.Environment]::SetEnvironmentVariable('PATH', $cur + ';%USERSCRIPTS%', 'User'); Write-Host '  [OK] Added to PATH: %USERSCRIPTS%' } else { Write-Host '  [OK] Already on PATH.' }"
 
 :skip_path_fix
 echo.
@@ -144,7 +144,7 @@ echo  You will be asked for your Gemini API key.
 echo  Get one for free at: https://aistudio.google.com/app/apikey
 echo.
 
-logwhisper setup
+"%~dp0.venv\Scripts\python.exe" -m agent setup
 echo.
 
 :: ── Done ─────────────────────────────────────────────────────

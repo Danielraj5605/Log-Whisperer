@@ -36,3 +36,6 @@ buffer/*.log
 # OS
 .DS_Store
 Thumbs.db
+# Runtime output
+logs/
+.pytest_cache/

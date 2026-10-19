@@ -4,13 +4,10 @@ version = "0.1.0"
 description = "AI-Powered Live Log Intelligence Agent"
 requires-python = ">=3.11"
 dependencies = [
-    "anthropic>=0.30.0",
-    "openai>=1.0.0",
     "rich>=13.0.0",
     "typer>=0.12.0",
     "PyYAML>=6.0.0",
-    "python-dateutil>=2.9.0",
-    "winotify>=1.0.0",
+    "winotify>=1.0.0; sys_platform == 'win32'",
     "httpx>=0.27.0",
 ]
 
@@ -27,7 +24,15 @@ dev = [
 requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
+[tool.setuptools]
+# Top-level modules that live outside the packages below
+py-modules = ["config", "logwhisper_splash"]
+
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["buffer", "ingest", "trigger", "agent", "output"]
+include = ["buffer*", "ingest*", "trigger*", "agent*", "output*"]
 namespaces = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"

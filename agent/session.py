@@ -5,18 +5,21 @@ from __future__ import annotations
 import json
 import os
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
 import yaml
 
+from config import expand_env
+
 
 def get_global_config_dir() -> Path:
     """Get the global config directory for logwhisper."""
     if sys.platform == "win32":
-        base = Path(os.environ.get("APPDATA", Path.home() / ".config"))
+        base = Path(os.environ.get("APPDATA") or (Path.home() / ".config"))
     else:
-        base = Path.home() / ".config"
+        base = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
     return base / "logwhisper"
 
 
@@ -25,46 +28,52 @@ def get_global_credentials_path() -> Path:
     return get_global_config_dir() / "credentials.json"
 
 
+def _read_credentials() -> dict[str, Any]:
+    """Load the credentials file ({} if missing, unreadable or malformed)."""
+    path = get_global_credentials_path()
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _write_credentials(data: dict[str, Any]) -> None:
+    """Atomically write the credentials file, owner-read/write only from the moment it exists."""
+    config_dir = get_global_config_dir()
+    config_dir.mkdir(parents=True, exist_ok=True)
+    path = get_global_credentials_path()
+
+    # mkstemp creates the file with mode 0600, so the secret is never world-readable
+    fd, tmp_name = tempfile.mkstemp(dir=config_dir, prefix=".credentials-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        os.replace(tmp_name, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
 def get_global_api_key() -> tuple[str | None, str | None]:
     """Get API key and provider from global config. Returns (api_key, provider)."""
-    creds_path = get_global_credentials_path()
-    if creds_path.exists():
-        try:
-            with open(creds_path, encoding="utf-8") as f:
-                data = json.load(f)
-            return data.get("api_key", ""), data.get("provider", "gemini")
-        except (json.JSONDecodeError, OSError):
-            pass
+    data = _read_credentials()
+    key = data.get("api_key")
+    if isinstance(key, str) and key.strip():
+        return key.strip(), data.get("provider") or "gemini"
     return None, "gemini"
 
 
 def save_global_api_key(api_key: str, provider: str = "gemini") -> None:
     """Save API key and provider to global config directory (securely)."""
-    config_dir = get_global_config_dir()
-    config_dir.mkdir(parents=True, exist_ok=True)
-
-    creds_path = get_global_credentials_path()
-    # Load existing to preserve telegram config
-    existing = {}
-    if creds_path.exists():
-        try:
-            with open(creds_path, encoding="utf-8") as f:
-                existing = json.load(f)
-        except (json.JSONDecodeError, OSError):
-            pass
-
+    existing = _read_credentials()  # preserve telegram config
     existing["api_key"] = api_key
     existing["provider"] = provider
-
-    with open(creds_path, "w", encoding="utf-8") as f:
-        json.dump(existing, f)
-
-    # Restrict permissions on Unix
-    if sys.platform != "win32":
-        try:
-            os.chmod(creds_path, 0o600)
-        except OSError:
-            pass
+    _write_credentials(existing)
 
 
 def get_api_key_and_provider() -> tuple[str | None, str | None]:
@@ -97,18 +106,9 @@ def get_fallback_key_and_provider() -> tuple[str | None, str | None]:
     Since we are now Gemini-only, there is no separate fallback key.
     Returns (None, 'unknown') unless a second key is stored in credentials.
     """
-    # Check credentials file for an explicit gemini_api_key secondary slot
-    creds_path = get_global_credentials_path()
-    if creds_path.exists():
-        try:
-            with open(creds_path, encoding="utf-8") as f:
-                data = json.load(f)
-            fallback_key = data.get("gemini_api_key", "").strip()
-            if fallback_key:
-                return fallback_key, "gemini"
-        except (json.JSONDecodeError, OSError):
-            pass
-
+    fallback_key = _read_credentials().get("gemini_api_key")
+    if isinstance(fallback_key, str) and fallback_key.strip():
+        return fallback_key.strip(), "gemini"
     return None, "unknown"
 
 
@@ -121,20 +121,31 @@ def get_api_key() -> str | None:
 def get_provider() -> str:
     """Get the configured LLM provider from global config or env."""
     _, provider = get_api_key_and_provider()
-    return provider
+    return provider or "unknown"
 
 
 def get_project_api_key() -> str | None:
-    """Get API key from project .logwhisper.yaml."""
+    """Get API key from project .logwhisper.yaml (supports ${ENV_VAR} references)."""
     config_path = Path.cwd() / ".logwhisper.yaml"
-    if config_path.exists():
-        try:
-            with open(config_path, encoding="utf-8") as f:
-                config = yaml.safe_load(f) or {}
-            return config.get("llm", {}).get("api_key", "")
-        except (yaml.YAMLError, OSError):
-            pass
-    return None
+    try:
+        with open(config_path, encoding="utf-8") as f:
+            config = yaml.safe_load(f)
+    except (yaml.YAMLError, OSError, UnicodeDecodeError):
+        return None
+    if not isinstance(config, dict):
+        return None
+    llm = config.get("llm")
+    if not isinstance(llm, dict):
+        return None
+    key = expand_env(llm.get("api_key"))
+    return key.strip() if isinstance(key, str) and key.strip() else None
+
+
+def mask_secret(secret: str, visible: int = 4) -> str:
+    """Show only the last few characters of a secret, e.g. '••••••••abcd'."""
+    if len(secret) <= visible * 2:
+        return "•" * len(secret)
+    return "•" * 8 + secret[-visible:]
 
 
 def prompt_api_key() -> str:
@@ -173,58 +184,26 @@ def ensure_api_key(existing_key: str | None = None) -> str:
 
 def get_telegram_config() -> dict[str, str]:
     """Get Telegram bot token and chat ID from global config."""
-    creds_path = get_global_credentials_path()
-    if creds_path.exists():
-        try:
-            with open(creds_path, encoding="utf-8") as f:
-                data = json.load(f)
-            return {
-                "bot_token": data.get("telegram_bot_token", ""),
-                "chat_id": data.get("telegram_chat_id", ""),
-            }
-        except (json.JSONDecodeError, OSError):
-            pass
-    return {"bot_token": "", "chat_id": ""}
+    data = _read_credentials()
+    return {
+        "bot_token": str(data.get("telegram_bot_token") or ""),
+        "chat_id": str(data.get("telegram_chat_id") or ""),
+    }
 
 
 def save_telegram_config(bot_token: str, chat_id: str) -> None:
     """Save Telegram config to global credentials file."""
-    config_dir = get_global_config_dir()
-    config_dir.mkdir(parents=True, exist_ok=True)
-
-    creds_path = get_global_credentials_path()
-    # Load existing to preserve API key
-    existing = {}
-    if creds_path.exists():
-        try:
-            with open(creds_path, encoding="utf-8") as f:
-                existing = json.load(f)
-        except (json.JSONDecodeError, OSError):
-            pass
-
+    existing = _read_credentials()  # preserve API key
     existing["telegram_bot_token"] = bot_token.strip()
     existing["telegram_chat_id"] = chat_id.strip()
-
-    with open(creds_path, "w", encoding="utf-8") as f:
-        json.dump(existing, f)
-
-    if sys.platform != "win32":
-        try:
-            os.chmod(creds_path, 0o600)
-        except OSError:
-            pass
+    _write_credentials(existing)
 
 
 def clear_telegram_config() -> None:
     """Remove Telegram config from global credentials."""
-    creds_path = get_global_credentials_path()
-    if creds_path.exists():
-        try:
-            with open(creds_path, encoding="utf-8") as f:
-                data = json.load(f)
-            data.pop("telegram_bot_token", None)
-            data.pop("telegram_chat_id", None)
-            with open(creds_path, "w", encoding="utf-8") as f:
-                json.dump(data, f)
-        except (json.JSONDecodeError, OSError):
-            pass
+    if not get_global_credentials_path().exists():
+        return
+    data = _read_credentials()
+    data.pop("telegram_bot_token", None)
+    data.pop("telegram_chat_id", None)
+    _write_credentials(data)

@@ -2,17 +2,17 @@
 
 from __future__ import annotations
 
-import sys
 import time
 from collections import deque
 from typing import Any
 
-from rich.color import Color
 from rich.console import Console
-from rich.live import Live
+from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
+
+from output import _fmt
 
 console = Console()
 
@@ -39,6 +39,11 @@ def _get_service_color(service: str) -> str:
         idx = len(_SERVICE_COLOR_MAP) % len(SERVICE_COLORS)
         _SERVICE_COLOR_MAP[service] = SERVICE_COLORS[idx]
     return _SERVICE_COLOR_MAP[service]
+
+
+def service_prefix(service: str) -> Text:
+    """Colored literal '[service]' tag (as Text, so the brackets are not read as markup)."""
+    return Text(f"[{service}]", style=_get_service_color(service))
 
 
 # --- Severity helpers ---
@@ -96,9 +101,8 @@ class ServiceStatusPanel:
             status = self._status.get(svc, "⏳ starting")
             err = self._error_count.get(svc, 0)
             lines = self._lines_count.get(svc, 0)
-            color = _get_service_color(svc)
             table.add_row(
-                f"[{color}]{svc}[/{color}]",
+                Text(svc, style=_get_service_color(svc)),
                 f"{status}  ·  {lines} lines  ·  {err} errors",
             )
 
@@ -126,16 +130,11 @@ class LogStreamPanel:
 
         text = Text()
         for svc, line in self._lines:
-            color = _get_service_color(svc)
-            prefix = f"[{color}][{svc}][/{color}]"
-            text.append(prefix, style=color)
+            text.append_text(service_prefix(svc))
             text.append("  ")
             text.append(line[:200])
             text.append("\n")
-
-        # Remove trailing newline
-        if text.plain.endswith("\n"):
-            text._text = text._text[:-1]
+        text.rstrip()
 
         return Panel(
             text,
@@ -150,17 +149,21 @@ class LogStreamPanel:
 
 
 def render_alert(finding: dict[str, Any], suppressed_count: int = 0) -> Panel:
-    """Render a single alert as a rich Panel."""
-    confidence = finding.get("confidence", "medium").lower()
-    trigger = finding.get("trigger", "")
-    source = finding.get("source", "unknown")
-    root_signal = finding.get("root_signal", "unknown")[:80]
-    caused_by = finding.get("caused_by", "")
-    evidence = finding.get("evidence", [])
-    blast_radius = finding.get("blast_radius", "")
-    action = finding.get("action", "")
+    """Render a single alert as a rich Panel.
+
+    Every value comes from logs or the LLM, so cells are built as Text (never parsed as
+    markup): a log line containing "[/foo]" must not crash the alert display.
+    """
+    confidence = _fmt.confidence(finding)
+    trigger = _fmt.text(finding, "trigger")
+    source = _fmt.text(finding, "source", "unknown")
+    root_signal = _fmt.text(finding, "root_signal", "unknown", 80)
+    caused_by = _fmt.text(finding, "caused_by", "", 100)
+    evidence = _fmt.items(finding, "evidence")
+    blast_radius = _fmt.text(finding, "blast_radius")
+    action = _fmt.text(finding, "action", "", 100)
     kb_match = finding.get("kb_match")
-    timestamp = finding.get("timestamp", "")[:19]
+    timestamp = _fmt.text(finding, "timestamp", "", 19)
 
     emoji = severity_emoji(confidence, trigger)
 
@@ -168,25 +171,27 @@ def render_alert(finding: dict[str, Any], suppressed_count: int = 0) -> Panel:
     grid.add_column(style="bold cyan")
     grid.add_column(style="white")
 
-    grid.add_row("Source", f"{source}")
-    grid.add_row("Trigger", trigger)
-    grid.add_row("Root signal", root_signal)
+    grid.add_row("Source", Text(source))
+    grid.add_row("Trigger", Text(trigger))
+    grid.add_row("Root signal", Text(root_signal))
     if caused_by:
-        grid.add_row("Caused by", caused_by[:100])
+        grid.add_row("Caused by", Text(caused_by))
     if evidence:
-        ev = evidence[0] if isinstance(evidence, list) else str(evidence)
-        grid.add_row("Evidence", str(ev)[:100])
+        grid.add_row("Evidence", Text(evidence[0][:100]))
     if blast_radius:
-        grid.add_row("Blast radius", blast_radius)
+        grid.add_row("Blast radius", Text(blast_radius))
     if action:
-        grid.add_row("Action", action[:100])
+        grid.add_row("Action", Text(action))
     if kb_match:
-        kb = kb_match if isinstance(kb_match, str) else kb_match.get("title", "")
-        grid.add_row("KB match", str(kb)[:60])
+        if isinstance(kb_match, dict):
+            kb = str(kb_match.get("title", ""))
+        else:
+            kb = str(kb_match)
+        grid.add_row("KB match", Text(kb[:60]))
     if suppressed_count > 0:
         grid.add_row("Suppressed", f"{suppressed_count} duplicates in cooldown")
 
-    title = f" {emoji} ANOMALY DETECTED  {timestamp}"
+    title = f" {emoji} ANOMALY DETECTED  {escape(timestamp)}"
     style = severity_color(confidence, trigger)
 
     return Panel(
@@ -200,8 +205,7 @@ def render_alert(finding: dict[str, Any], suppressed_count: int = 0) -> Panel:
 
 def print_alert(finding: dict[str, Any], suppressed_count: int = 0) -> None:
     """Print a single alert to the terminal."""
-    panel = render_alert(finding, suppressed_count)
-    console.print(panel)
+    console.print(render_alert(finding, suppressed_count))
 
 
 # --- Per-service log printer ---
@@ -209,16 +213,17 @@ def print_alert(finding: dict[str, Any], suppressed_count: int = 0) -> None:
 
 def print_service_log(service: str, line: str) -> None:
     """Print a single log line with colored [SERVICE] prefix."""
-    color = _get_service_color(service)
-    prefix = f"[{color}][{service}][/{color}]"
-    console.print(f"{prefix}  {line}")
+    out = service_prefix(service)
+    out.append("  ")
+    out.append(line)
+    console.print(out, soft_wrap=True, highlight=False)
 
 
 # --- Live status bar (updated) ---
 
 
 class LiveStatusBar:
-    """Live updating status bar at the bottom of the terminal."""
+    """Status bar renderable (alert / suppressed counts, uptime) for watched sources."""
 
     def __init__(
         self,
@@ -257,7 +262,7 @@ class LiveStatusBar:
         status = Table(box=None, show_header=False, padding=(0, 2))
         status.add_column(style="green")
         status.add_column(style="white")
-        status.add_row("● Watching", src_label)
+        status.add_row("● Watching", Text(src_label))
         status.add_row(
             "Alerts",
             f"[yellow]{self._alert_count}[/yellow]  "

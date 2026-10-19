@@ -3,51 +3,42 @@
 from __future__ import annotations
 
 import asyncio
-import json
+import logging
+import os
 import re
-import subprocess
-import sys
 from pathlib import Path
 from typing import Any
 
-from rich.console import Console
+from rich.markup import escape
 from rich.panel import Panel
-from rich.columns import Columns
-from rich.rule import Rule
 from rich.table import Table
 from rich.text import Text
 
 from logwhisper_splash import show_splash
 
-from agent.agent import GeminiAgent
 from agent.chat import ChatAgent, get_project_context
-from agent.detect import detect_project_parts, detect_project_type, get_project_name
 from agent.deps import check_service_deps
-from agent.session import get_api_key, get_api_key_and_provider, get_fallback_key_and_provider, get_telegram_config
-from buffer.parser import parse
-from buffer.ring_buffer import RingBuffer
-from output.dashboard import Dashboard
-from output.terminal import print_service_log
-from ingest.file_adapter import FileAdapter
-from output.terminal import print_alert, print_service_log
-from output.telegram_notification import TelegramNotifier
-from output.windows_notification import WindowsNotifier
-from trigger.cooldown import CooldownTracker
-from trigger.engine import TriggerEngine
-from trigger.rules import (
-    CriticalKeywordRule,
-    HttpErrorRule,
-    MetricThresholdRule,
-    ClusterFormationRule,
-    SilenceAnomalyRule,
-    NewErrorTypeRule,
-    RateSpikeRule,
+from agent.detect import detect_project_parts
+from agent.pipeline import Monitor
+from agent.procs import ainput, iter_lines, spawn, terminate
+from agent.run import run_install
+from agent.session import (
+    clear_telegram_config,
+    get_api_key_and_provider,
+    get_telegram_config,
+    mask_secret,
+    save_global_api_key,
+    save_telegram_config,
 )
+from buffer.parser import parse
+from ingest.file_adapter import FileAdapter
+from output.telegram_notification import TelegramNotifier
+from output.terminal import console, print_service_log
 
-console = Console()
+logger = logging.getLogger("logwhisper")
 
-# ANSI strip pattern (from run.py)
-_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
+# ANSI strip pattern
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]")
 
 # Detect localhost URLs printed by dev servers (handles IPv4, IPv6, 0.0.0.0)
 _URL_RE = re.compile(
@@ -66,10 +57,10 @@ HELP_TEXT = """\
   [cyan]/run-frontend[/cyan]             Start only the frontend service
   [cyan]/run-backend[/cyan]              Start only the backend service
   [cyan]/stop[/cyan]                     Stop all running services
-  [cyan]/watch [file][/cyan]             Watch a log file (e.g. /watch ./logs/app.log)
-  [cyan]/chat [message][/cyan]           Ask the AI about errors (e.g. /chat why did the 401 happen?)
+  [cyan]/watch \\[file][/cyan]             Watch a log file (e.g. /watch ./logs/app.log)
+  [cyan]/chat \\[message][/cyan]           Ask the AI about errors (e.g. /chat why did the 401 happen?)
   [cyan]/telegram-setup[/cyan]           Run Telegram setup wizard
-  [cyan]/telegram [test/status/clear][/cyan]  Manage Telegram alerts
+  [cyan]/telegram \\[test/status/clear][/cyan]  Manage Telegram alerts
   [cyan]/setup[/cyan]                    Run full setup wizard (API key + Telegram)
   [cyan]/exit[/cyan] or [cyan]Ctrl+C[/cyan]    Stop services and exit
 
@@ -85,7 +76,7 @@ class REPLSession:
 
     Manages:
     - Service processes (start/stop frontend, backend, or all)
-    - Monitoring tasks (trigger engine, agent worker, file tailing)
+    - Monitoring (trigger engine, agent worker)
     - Chat via ChatAgent
     - Telegram + Windows notifications
     """
@@ -95,33 +86,23 @@ class REPLSession:
         self._services_running = False
 
         # Project detection
-        self._parts = detect_project_parts()
-        if not self._parts:
-            self._parts = {}
+        self._parts = detect_project_parts() or {}
 
         # API key and provider — don't prompt during init, let /setup or /chat handle it
         api_key, detected_provider = get_api_key_and_provider()
         self._api_key = api_key
-        self._provider = detected_provider if detected_provider != "unknown" else "gemini"
+        self._provider = detected_provider if detected_provider and detected_provider != "unknown" else "gemini"
 
-        # Monitoring components (created when services start)
-        self._buffer: RingBuffer | None = None
-        self._engine: TriggerEngine | None = None
-        self._agent: GeminiAgent | None = None
-        self._windows_notifier: WindowsNotifier | None = None
-        self._telegram_notifier: TelegramNotifier | None = None
+        # Monitoring (created when services start)
+        self._monitor: Monitor | None = None
+        self._chat: ChatAgent | None = None
 
         # Service processes
         self._processes: dict[str, asyncio.subprocess.Process] = {}
-        self._log_files: dict[str, Any] = {}
         self._log_file_handles: dict[str, Any] = {}
-
-        # Dashboard
-        self._dashboard: Dashboard | None = None
 
         # Background tasks
         self._all_tasks: list[asyncio.Task[Any]] = []
-        self._finding_count = [0]
 
     # ── Public API ──────────────────────────────────────────────────────────
 
@@ -130,24 +111,22 @@ class REPLSession:
         self._running = True
         self._print_banner()
 
-        while self._running:
-            try:
-                line = await asyncio.get_event_loop().run_in_executor(
-                    None, lambda: console.input("[bold cyan]>[/bold cyan] ")
-                )
-                if not line:
-                    continue
-
+        try:
+            while self._running:
+                try:
+                    line = await ainput(lambda: console.input("[bold cyan]>[/bold cyan] "))
+                except EOFError:
+                    break
                 cmd = line.strip()
                 if not cmd:
                     continue
-
                 await self._route(cmd)
-
-            except (EOFError, KeyboardInterrupt):
-                await self._cmd_stop()
-                self._running = False
-                break
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            console.print()
+        finally:
+            # Always stop the services we started — never leave orphaned dev servers behind
+            await self._cmd_stop(quiet=True)
+            self._running = False
 
         self._print_goodbye()
 
@@ -155,39 +134,39 @@ class REPLSession:
 
     async def _route(self, cmd: str) -> None:
         """Route user input to the appropriate handler."""
-        lower = cmd.lower()
-
         # No-slash chat — treat as a chat message
-        if not lower.startswith("/"):
+        if not cmd.startswith("/"):
             await self._cmd_chat(cmd)
             return
 
-        # Slash commands
-        if lower == "/help":
+        name, _, args = cmd.partition(" ")
+        name = name.lower()
+        args = args.strip()
+
+        if name == "/help":
             self._cmd_help()
-        elif lower == "/run":
+        elif name == "/run":
             await self._cmd_run()
-        elif lower == "/run-frontend":
-            await self._cmd_run_frontend()
-        elif lower == "/run-backend":
-            await self._cmd_run_backend()
-        elif lower == "/stop":
+        elif name == "/run-frontend":
+            await self._cmd_run_only("frontend", ("frontend",))
+        elif name == "/run-backend":
+            await self._cmd_run_only("backend", ("backend", "server"))
+        elif name == "/stop":
             await self._cmd_stop()
-        elif lower.startswith("/chat"):
-            await self._cmd_chat(cmd[6:].strip())  # remove "/chat "
-        elif lower.startswith("/watch"):
-            await self._cmd_watch(cmd[7:].strip())
-        elif lower == "/telegram-setup":
+        elif name == "/chat":
+            await self._cmd_chat(args)
+        elif name == "/watch":
+            await self._cmd_watch(args)
+        elif name == "/telegram-setup":
             await self._cmd_telegram_setup()
-        elif lower.startswith("/telegram"):
-            await self._cmd_telegram(cmd[10:].strip())
-        elif lower == "/setup":
+        elif name == "/telegram":
+            await self._cmd_telegram(args)
+        elif name == "/setup":
             await self._cmd_setup()
-        elif lower in ("/exit", "/quit", "/q"):
-            await self._cmd_stop()
+        elif name in ("/exit", "/quit", "/q"):
             self._running = False
         else:
-            console.print(f"[yellow]Unknown command:[/yellow] {cmd}")
+            console.print(f"[yellow]Unknown command:[/yellow] {escape(cmd)}")
             console.print("[dim]Type /help for available commands[/dim]")
 
     # ── Command Handlers ────────────────────────────────────────────────────
@@ -203,7 +182,6 @@ class REPLSession:
             return
 
         # Re-detect every time so we always pick up the latest detect.py output
-        # (including the 'url' field added to each service entry).
         self._parts = detect_project_parts()
         if not self._parts:
             console.print("[yellow]No project detected. Use /run-frontend or /run-backend manually.[/yellow]")
@@ -211,23 +189,21 @@ class REPLSession:
 
         console.print(f"[green]Starting {len(self._parts)} service(s)...[/green]")
         for name, info in self._parts.items():
-            console.print(f"  [cyan]{name}[/cyan] — {info['command']}")
+            console.print(f"  [cyan]{escape(name)}[/cyan] — {escape(info['command'])}")
         console.print()
 
-        await self._start_all_services(list(self._parts.keys()), use_dashboard=False)
-        self._services_running = True
-        console.print("[green]All services started.[/green]")
+        if not await self._start_services(list(self._parts.keys())):
+            return
+        console.print("[green]Services started.[/green]")
         console.print("[dim]Use /stop to stop them, or /chat to ask about errors.[/dim]")
 
         # Print URLs for every service that has one — always shown, regardless of server output
-        urls_to_show = [(name, info["url"]) for name, info in self._parts.items() if info.get("url")]
-        if urls_to_show:
-            console.print()
-            for name, url in urls_to_show:
+        for name, info in self._parts.items():
+            if name in self._processes and info.get("url"):
                 console.print(
                     Panel(
-                        f"[bold green]\U0001f310  {name}[/bold green]\n\n"
-                        f"   [bold white underline]{url}[/bold white underline]"
+                        f"[bold green]\U0001f310  {escape(name)}[/bold green]\n\n"
+                        f"   [bold white underline]{escape(info['url'])}[/bold white underline]"
                         f"  [dim]← open in browser[/dim]",
                         border_style="green",
                         padding=(0, 2),
@@ -236,66 +212,41 @@ class REPLSession:
                 )
         console.print()
 
-    async def _cmd_run_frontend(self) -> None:
-        """Start only the frontend service."""
+    async def _cmd_run_only(self, label: str, name_hints: tuple[str, ...]) -> None:
+        """Start only the services whose name contains one of the hints."""
         if self._services_running:
             console.print("[yellow]Services are already running.[/yellow]")
             return
 
-        frontend_parts = {k: v for k, v in self._parts.items() if "frontend" in k.lower()}
-        if not frontend_parts:
-            console.print("[yellow]No frontend service detected.[/yellow]")
+        self._parts = detect_project_parts()
+        selected = [k for k in self._parts if any(h in k.lower() for h in name_hints)]
+        if not selected:
+            console.print(f"[yellow]No {label} service detected.[/yellow]")
             return
 
-        await self._start_all_services(list(frontend_parts.keys()), use_dashboard=False)
-        self._services_running = True
-        console.print("[green]Frontend started.[/green]\n")
+        if await self._start_services(selected):
+            console.print(f"[green]{label.capitalize()} started.[/green]\n")
 
-    async def _cmd_run_backend(self) -> None:
-        """Start only the backend service."""
-        if self._services_running:
-            console.print("[yellow]Services are already running.[/yellow]")
-            return
-
-        backend_parts = {k: v for k, v in self._parts.items() if "backend" in k.lower() or "server" in k.lower()}
-        if not backend_parts:
-            console.print("[yellow]No backend service detected.[/yellow]")
-            return
-
-        await self._start_all_services(list(backend_parts.keys()), use_dashboard=False)
-        self._services_running = True
-        console.print("[green]Backend started.[/green]\n")
-
-    async def _cmd_stop(self) -> None:
+    async def _cmd_stop(self, quiet: bool = False) -> None:
         """Stop all running services and cancel monitoring tasks."""
-        if not self._processes:
-            console.print("[dim]No services running.[/dim]")
+        if not self._processes and not self._all_tasks:
+            if not quiet:
+                console.print("[dim]No services running.[/dim]")
             self._services_running = False
             return
 
-        console.print("[dim]Stopping services...[/dim]")
+        if not quiet:
+            console.print("[dim]Stopping services...[/dim]")
 
         # Cancel background tasks
-        for task in self._all_tasks:
+        tasks, self._all_tasks = self._all_tasks, []
+        for task in tasks:
             task.cancel()
-        self._all_tasks.clear()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
-        # Kill processes
-        for name, proc in list(self._processes.items()):
-            try:
-                if sys.platform == "win32":
-                    subprocess.run(
-                        ["taskkill", "/F", "/PID", str(proc.pid)],
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        check=False,
-                    )
-                else:
-                    proc.terminate()
-            except Exception:
-                pass
-
-        self._processes.clear()
+        # Kill process trees
+        procs, self._processes = list(self._processes.values()), {}
+        await asyncio.gather(*(terminate(p) for p in procs), return_exceptions=True)
 
         # Close log files
         for lf in self._log_file_handles.values():
@@ -305,13 +256,9 @@ class REPLSession:
                 pass
         self._log_file_handles.clear()
 
-        # Stop dashboard
-        if self._dashboard:
-            self._dashboard.stop()
-            self._dashboard = None
-
         self._services_running = False
-        console.print("[dim]All services stopped.[/dim]\n")
+        if not quiet:
+            console.print("[dim]All services stopped.[/dim]\n")
 
     async def _cmd_chat(self, message: str) -> None:
         """Send a message to the AI chat agent."""
@@ -326,86 +273,51 @@ class REPLSession:
         console.print("[dim]Thinking...[/dim]")
 
         # ── Build service status block ─────────────────────────────────────
-        service_status_lines: list[str] = []
+        context_lines: list[str] = []
         if self._processes:
-            service_status_lines.append("[RUNNING SERVICES]")
+            context_lines.append("[RUNNING SERVICES]")
             for name, proc in self._processes.items():
-                alive = proc.returncode is None
-                status = "running" if alive else f"stopped (exit {proc.returncode})"
-                info = self._parts.get(name, {})
-                cmd = info.get("command", "unknown")
-                service_status_lines.append(f"  {name}: {status}  (cmd: {cmd})")
-            service_status_lines.append("")
+                status = "running" if proc.returncode is None else f"stopped (exit {proc.returncode})"
+                cmd = self._parts.get(name, {}).get("command", "unknown")
+                context_lines.append(f"  {name}: {status}  (cmd: {cmd})")
+            context_lines.append("")
         else:
-            service_status_lines.append("[NO SERVICES RUNNING — user has not run /run yet]")
-            service_status_lines.append("")
+            context_lines.append("[NO SERVICES RUNNING — user has not run /run yet]")
+            context_lines.append("")
 
-        # ── Gather ALL buffered log lines (not just recent window) ─────────
+        # ── Recent buffered log lines ─────────────────────────────────────
         log_lines: list[str] = []
-        if self._buffer and len(self._buffer) > 0:
-            # Pull everything in the buffer (up to 100 lines)
-            all_entries = list(self._buffer._buf)[-100:]
-            for entry in all_entries:
-                source = entry.get("source", "")
-                level = entry.get("level", "INFO")
+        if self._monitor:
+            for entry in self._monitor.buffer.recent(100):
                 raw = entry.get("raw", "")
                 if raw:
-                    log_lines.append(f"[{source}] [{level}] {raw}")
+                    log_lines.append(f"[{entry.get('source', '')}] [{entry.get('level', 'INFO')}] {raw}")
+        context_lines += log_lines or ["[No log lines captured yet]"]
 
-        # Prepend service status to log lines so the AI always sees it
-        combined_context = service_status_lines + (log_lines if log_lines else ["[No log lines captured yet]"])
-
-        # Get fallback key for auto-failover
-        fallback_key, fallback_provider = get_fallback_key_and_provider()
+        if self._chat is None or self._chat.api_key != self._api_key:
+            self._chat = ChatAgent(api_key=self._api_key, provider=self._provider)
 
         try:
-            agent = ChatAgent(api_key=self._api_key, provider=self._provider)
-            response = await agent.ask(
+            response = await self._chat.ask(
                 message,
-                log_lines=combined_context,
-                fallback_key=fallback_key,
-                fallback_provider=fallback_provider,
+                log_lines=context_lines,
+                project_context=get_project_context(),
             )
         except Exception as exc:
-            console.print(f"[red]Chat error:[/red] {exc}")
+            console.print(f"[red]Chat error:[/red] {escape(str(exc))}")
             return
 
-        # Frame the chat reply with horizontal rules for quick visual parsing (Claude-style).
+        # Frame the chat reply with horizontal rules for quick visual parsing.
         console.print("[dim]" + ("-" * 60) + "[/dim]")
-        console.print(Panel(response, border_style="cyan", padding=(1, 2)))
+        console.print(Panel(Text(response), border_style="cyan", padding=(1, 2)))
         console.print("[dim]" + ("-" * 60) + "[/dim]")
 
     async def _cmd_watch(self, args: str) -> None:
         """Watch a log file, or stream the live service buffer if no file given."""
         if not args:
             # No file given — if services are running, replay buffer then stream live
-            if self._processes and self._buffer:
-                console.print("[dim]Streaming live service logs (Ctrl+C to stop):[/dim]\n")
-                # First, replay everything already in the buffer
-                for entry in list(self._buffer._buf):
-                    source = entry.get("source", "")
-                    raw = _ANSI_RE.sub("", entry.get("raw", ""))
-                    if raw:
-                        console.print(f"[dim][{source}][/dim] {raw}")
-                # Then tail new lines as they arrive (buffer is fed by background tasks)
-                seen = len(self._buffer)
-                console.print("[dim]--- live ---[/dim]")
-                try:
-                    while True:
-                        await asyncio.sleep(0.2)
-                        current = list(self._buffer._buf)
-                        if len(current) > seen:
-                            for entry in current[seen:]:
-                                source = entry.get("source", "")
-                                raw = _ANSI_RE.sub("", entry.get("raw", ""))
-                                if raw:
-                                    console.print(f"[dim][{source}][/dim] {raw}")
-                            seen = len(current)
-                except asyncio.CancelledError:
-                    pass
-                except KeyboardInterrupt:
-                    pass
-                console.print("[dim]Stopped watching.[/dim]\n")
+            if self._processes and self._monitor:
+                await self._stream_buffer(self._monitor)
             else:
                 console.print("[dim]No services running. Usage:[/dim]")
                 console.print("  /watch ./logs/app.log   -- tail a log file")
@@ -413,20 +325,20 @@ class REPLSession:
             return
 
         # File path given — tail that file
-        file_path = args.strip()
+        file_path = args
         if file_path.startswith("--file"):
-            file_path = file_path.replace("--file", "").strip()
+            file_path = file_path[len("--file"):].strip()
 
         if not file_path:
             console.print("[dim]Usage: /watch ./logs/app.log[/dim]")
             return
 
-        p = Path(file_path)
-        if not p.exists():
-            console.print(f"[red]File not found:[/red] {file_path}")
+        p = Path(file_path.strip("\"'"))
+        if not p.is_file():
+            console.print(f"[red]File not found:[/red] {escape(file_path)}")
             return
 
-        console.print(f"[dim]Watching:[/dim] {file_path}")
+        console.print(f"[dim]Watching:[/dim] {escape(file_path)}")
         console.print("[dim]Press Ctrl+C to stop watching.[/dim]\n")
 
         adapter = FileAdapter(path=p, poll_ms=100)
@@ -434,89 +346,114 @@ class REPLSession:
             async for log_obj in adapter.stream():
                 clean = _ANSI_RE.sub("", log_obj.get("raw", ""))
                 if clean:
-                    console.print(clean)
+                    console.print(Text(clean), soft_wrap=True, highlight=False)
         except asyncio.CancelledError:
-            pass
+            self._swallow_cancel()
+        finally:
+            adapter.stop()
         console.print("[dim]Stopped watching.[/dim]\n")
+
+    async def _stream_buffer(self, monitor: Monitor) -> None:
+        """Replay the buffered service logs, then follow new lines until Ctrl+C."""
+        console.print("[dim]Streaming live service logs (Ctrl+C to stop):[/dim]\n")
+        seq = 0
+        try:
+            while True:
+                entries, seq = monitor.buffer.since(seq)
+                for entry in entries:
+                    raw = _ANSI_RE.sub("", entry.get("raw", ""))
+                    if raw:
+                        console.print(
+                            Text.assemble((f"[{entry.get('source', '')}] ", "dim"), raw),
+                            soft_wrap=True,
+                            highlight=False,
+                        )
+                await asyncio.sleep(0.2)
+        except asyncio.CancelledError:
+            self._swallow_cancel()
+        console.print("[dim]Stopped watching.[/dim]\n")
+
+    @staticmethod
+    def _swallow_cancel() -> None:
+        """Ctrl+C cancels the REPL's task; for sub-commands it should only end the sub-command."""
+        task = asyncio.current_task()
+        if task is not None and hasattr(task, "uncancel"):
+            task.uncancel()
 
     async def _cmd_telegram_setup(self) -> None:
         """Run Telegram setup wizard."""
         console.print("[dim]Running Telegram setup...[/dim]")
-        # Import and call the setup function
-        from agent.session import save_telegram_config, get_telegram_config, clear_telegram_config
-        from rich.prompt import Confirm, Prompt
-        from output.telegram_notification import TelegramNotifier
+        from rich.prompt import Confirm
 
         existing = get_telegram_config()
         if existing["bot_token"] and existing["chat_id"]:
             console.print("[green]Telegram is already configured.[/green]")
-            overwrite = Confirm.ask("Overwrite?", default=False)
-            if not overwrite:
+            if not await ainput(lambda: Confirm.ask("Overwrite?", default=False)):
                 return
 
         console.print("\n[cyan]Telegram Setup[/cyan]")
         console.print("Steps:")
-        console.print("  1. Open Telegram → chat with [@BotFather](https://t.me/BotFather)")
+        console.print("  1. Open Telegram → chat with @BotFather (https://t.me/BotFather)")
         console.print("  2. Send /newbot → copy your bot token")
         console.print("  3. Open your bot → send /start")
         console.print("  4. Forward a message to @userinfobot → copy your Chat ID\n")
 
-        bot_token = console.input("Bot token: ")
-        chat_id = console.input("Chat ID: ")
+        bot_token = await ainput(lambda: console.input("Bot token: ", password=True))
+        chat_id = await ainput(lambda: console.input("Chat ID: "))
 
         if not bot_token.strip() or not chat_id.strip():
             console.print("[red]Token and chat ID cannot be empty.[/red]")
             return
 
-        save_telegram_config(bot_token, chat_id)
         console.print("[dim]Sending test message...[/dim]")
-
         notifier = TelegramNotifier(bot_token=bot_token.strip(), chat_id=chat_id.strip())
-        if notifier.send_text("✅ <b>Log Whisperer</b> — Telegram alerts configured!"):
+        # Only persist credentials that actually work
+        if await asyncio.to_thread(
+            notifier.send_text, "✅ <b>Log Whisperer</b> — Telegram alerts configured!"
+        ):
+            save_telegram_config(bot_token, chat_id)
             console.print("[green]Telegram configured successfully![/green]\n")
         else:
             console.print("[red]Failed to send test message. Check your token and chat ID.[/red]")
-            clear_telegram_config()
 
     async def _cmd_telegram(self, action: str) -> None:
         """Manage Telegram alerts."""
-        action = action.strip().lower()
-        from agent.session import get_telegram_config, clear_telegram_config
-        from output.telegram_notification import TelegramNotifier
+        action = action.strip().lower() or "status"
 
-        cfg = get_telegram_config()
+        if action not in ("status", "test", "clear"):
+            console.print(f"[yellow]Unknown Telegram action:[/yellow] {escape(action)}")
+            console.print("Usage: /telegram \\[test|status|clear]")
+            return
 
         if action == "clear":
             clear_telegram_config()
             console.print("[green]Telegram configuration cleared.[/green]")
             return
 
+        cfg = get_telegram_config()
         if not cfg["bot_token"] or not cfg["chat_id"]:
             console.print("[yellow]Telegram not configured.[/yellow]")
             console.print("Run [green]/telegram-setup[/green] to configure.\n")
             return
 
-        if action == "status" or not action:
+        if action == "status":
             table = Table(box=None, show_header=False, padding=(0, 2))
             table.add_column(style="bold cyan")
             table.add_column(style="white")
-            table.add_row("Bot token", f"{cfg['bot_token'][:10]}...{cfg['bot_token'][-4:]}")
+            table.add_row("Bot token", mask_secret(cfg["bot_token"]))
             table.add_row("Chat ID", cfg["chat_id"])
             table.add_row("Status", "[green]Configured[/green]")
             console.print(table)
             return
 
-        if action == "test":
-            console.print("[dim]Sending test message...[/dim]")
-            notifier = TelegramNotifier(bot_token=cfg["bot_token"], chat_id=cfg["chat_id"])
-            if notifier.send_text("✅ <b>Log Whisperer</b> — Test message received!"):
-                console.print("[green]Test message sent![/green]")
-            else:
-                console.print("[red]Failed to send. Check your configuration.[/red]")
-            return
-
-        console.print(f"[yellow]Unknown Telegram action:[/yellow] {action}")
-        console.print("Usage: /telegram [test|status|clear]")
+        console.print("[dim]Sending test message...[/dim]")
+        notifier = TelegramNotifier(bot_token=cfg["bot_token"], chat_id=cfg["chat_id"])
+        if await asyncio.to_thread(
+            notifier.send_text, "✅ <b>Log Whisperer</b> — Test message received!"
+        ):
+            console.print("[green]Test message sent![/green]")
+        else:
+            console.print("[red]Failed to send. Check your configuration.[/red]")
 
     async def _cmd_setup(self) -> None:
         """Run the full setup wizard."""
@@ -524,190 +461,103 @@ class REPLSession:
 
         console.print("[dim]Running setup wizard...[/dim]\n")
 
-        # API key setup — show provider info
         existing_key, existing_provider = get_api_key_and_provider()
         if existing_key:
-            provider_tag = f"[dim]({existing_provider})[/dim]"
-            console.print(f"[green]API key already configured.[/green] {provider_tag}")
-            console.print(f"  [dim]{existing_key[:12]}...{existing_key[-4:]}[/dim]")
-            if not Confirm.ask("Overwrite?", default=False):
-                console.print("[dim]Skipping API key setup.[/dim]")
-            else:
+            console.print(f"[green]API key already configured.[/green] [dim]({escape(str(existing_provider))})[/dim]")
+            console.print(f"  [dim]{mask_secret(existing_key)}[/dim]")
+            if await ainput(lambda: Confirm.ask("Overwrite?", default=False)):
                 await self._setup_api_key()
+            else:
+                console.print("[dim]Skipping API key setup.[/dim]")
         else:
             await self._setup_api_key()
 
-        # Telegram setup
-        if Confirm.ask("Set up Telegram alerts?", default=True):
+        if await ainput(lambda: Confirm.ask("Set up Telegram alerts?", default=True)):
             await self._cmd_telegram_setup()
 
         console.print("[green]Setup complete![/green]\n")
 
     async def _setup_api_key(self) -> None:
         """Interactive API key setup for Gemini."""
-        from agent.session import save_global_api_key
-
         console.print("[cyan]API Key Setup[/cyan]\n")
         console.print("  Get your key at: [blue]https://aistudio.google.com/app/apikey[/blue]\n")
 
-        key = console.input("Enter your Gemini API key: ").strip()
+        key = (await ainput(lambda: console.input("Enter your Gemini API key: ", password=True))).strip()
         if not key:
             console.print("[red]API key cannot be empty.[/red]\n")
             return
 
-        save_global_api_key(key.strip(), provider="gemini")
-        self._api_key = key.strip()
+        save_global_api_key(key, provider="gemini")
+        self._api_key = key
         self._provider = "gemini"
         console.print("[green]API key saved![/green] (gemini-2.5-flash ready)\n")
 
     # ── Service Management ────────────────────────────────────────────────────
 
-    async def _start_all_services(self, service_names: list[str], use_dashboard: bool = True) -> None:
-        """Start services by name and begin monitoring."""
+    async def _start_services(self, service_names: list[str]) -> bool:
+        """Start services by name and begin monitoring. Returns True if any service started."""
         parts = {k: v for k, v in self._parts.items() if k in service_names}
         if not parts:
-            return
+            return False
 
-        # Setup monitoring
-        from config import load as load_config
-        cfg = load_config()
-        trigger_cfg = cfg.get("triggers", {})
-        rate_cfg = trigger_cfg.get("rate_spike", {})
-        crit_cfg = trigger_cfg.get("critical_keyword", {})
-        jsonl_cfg = cfg.get("output", {}).get("jsonl", {})
-
-        self._buffer = RingBuffer(maxlen=500)
-        self._engine = TriggerEngine(
-            rules=[
-                NewErrorTypeRule(),
-                RateSpikeRule(
-                    threshold=rate_cfg.get("threshold", 3),
-                    window_seconds=rate_cfg.get("window_seconds", 10),
-                ),
-                CriticalKeywordRule(extra_keywords=crit_cfg.get("extra_keywords", [])),
-                HttpErrorRule(),
-                MetricThresholdRule(),
-                ClusterFormationRule(),
-                SilenceAnomalyRule(),
-            ],
-            cooldowns=CooldownTracker(),
-            agent_queue=asyncio.Queue(maxsize=50),
-        )
-        self._agent = GeminiAgent(api_key=self._api_key)
-        self._windows_notifier = WindowsNotifier()
-
-        tg_cfg = get_telegram_config()
-        self._telegram_notifier = None
-        if tg_cfg["bot_token"] and tg_cfg["chat_id"]:
-            self._telegram_notifier = TelegramNotifier(
-                bot_token=tg_cfg["bot_token"],
-                chat_id=tg_cfg["chat_id"],
+        if not self._api_key:
+            console.print(
+                "[yellow]No API key configured — services will run, but alerts can't be "
+                "analyzed. Run /setup to add one.[/yellow]"
             )
-
-        self._finding_count = [0]
-
-        async def on_finding(finding: dict[str, Any]) -> None:
-            self._finding_count[0] += 1
-            source = finding.get("source", "unknown")
-            if self._dashboard:
-                self._dashboard.add_alert(finding)
-                self._dashboard.increment_errors(source)
-            if self._windows_notifier:
-                try:
-                    self._windows_notifier.notify(finding)
-                except Exception:
-                    pass
-            if self._telegram_notifier:
-                try:
-                    await self._telegram_notifier.notify(finding, project=get_project_name())
-                except Exception:
-                    pass
-            # Write alert to JSONL log
-            if jsonl_cfg.get("enabled", True):
-                try:
-                    jsonl_path = Path(jsonl_cfg.get("path", ".logwhisper/alerts.jsonl"))
-                    jsonl_path.parent.mkdir(parents=True, exist_ok=True)
-                    with open(jsonl_path, "a", encoding="utf-8") as jf:
-                        jf.write(json.dumps(finding) + "\n")
-                except Exception:
-                    pass
-            print_alert(finding, suppressed_count=self._engine.suppression_count)
-
-        # Create log file handles
-        for name, info in parts.items():
-            log_dir = Path(info["log_path"]).parent
-            log_dir.mkdir(parents=True, exist_ok=True)
-            lf = open(info["log_path"], "a", encoding="utf-8", errors="replace")
-            self._log_file_handles[name] = lf
 
         # Check and install dependencies BEFORE spawning services
         await self._check_and_install_deps(parts)
 
-        # Optionally start the dashboard (lives above the log stream)
-        self._dashboard: Dashboard | None = None
-        if use_dashboard:
-            self._dashboard = Dashboard(service_names=list(parts.keys()))
-            self._dashboard.start()
+        monitor = Monitor(self._api_key or "")
+        self._monitor = monitor
 
-        # Spawn subprocesses
+        started: dict[str, asyncio.subprocess.Process] = {}
         for name, info in parts.items():
-            lf = self._log_file_handles.get(name)
+            log_path = Path(info["log_path"])
             try:
-                proc = await asyncio.create_subprocess_shell(
-                    info["command"],
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.STDOUT,
-                )
-                self._processes[name] = proc
-                if self._dashboard:
-                    self._dashboard.set_running(name)
-                console.print(f"[green]Started {name}[/green] (PID {proc.pid})")
+                log_path.parent.mkdir(parents=True, exist_ok=True)
+                lf = open(log_path, "a", encoding="utf-8", errors="replace")
+            except OSError as exc:
+                console.print(f"[red]Cannot open log file for {escape(name)}:[/red] {escape(str(exc))}")
+                continue
 
-                # Print the expected URL immediately — don't wait for server output
-                url = info.get("url")
-                if url:
-                    console.print(
-                        Panel(
-                            f"[bold green]\U0001f310  {name}[/bold green]\n\n"
-                            f"   Open [bold white underline]{url}[/bold white underline]"
-                            f"  [dim](server is starting...)[/dim]",
-                            border_style="green",
-                            padding=(0, 2),
-                            expand=False,
-                        )
-                    )
+            try:
+                proc = await spawn(info["command"])
             except Exception as exc:
-                console.print(f"[red]Failed to start {name}:[/red] {exc}")
-                if self._dashboard:
-                    self._dashboard.set_error(name)
+                lf.close()
+                console.print(f"[red]Failed to start {escape(name)}:[/red] {escape(str(exc))}")
+                continue
+
+            self._log_file_handles[name] = lf
+            self._processes[name] = proc
+            started[name] = proc
+            console.print(f"[green]Started {escape(name)}[/green] (PID {proc.pid})")
+
+            url = info.get("url")
+            if url:
+                console.print(
+                    Panel(
+                        f"[bold green]\U0001f310  {escape(name)}[/bold green]\n\n"
+                        f"   Open [bold white underline]{escape(url)}[/bold white underline]"
+                        f"  [dim](server is starting...)[/dim]",
+                        border_style="green",
+                        padding=(0, 2),
+                        expand=False,
+                    )
+                )
 
         console.print()
+        if not started:
+            return False
 
-        # Start background tasks
-        worker_task = asyncio.create_task(
-            self._agent_worker(
-                self._engine.agent_queue,  # type: ignore[union-attr]
-                self._agent,
-                on_finding,
+        self._services_running = True
+        self._all_tasks.append(monitor.start_worker())
+        for name, proc in started.items():
+            self._all_tasks.append(
+                asyncio.create_task(self._read_service_output(name, proc, self._log_file_handles[name]))
             )
-        )
-        self._all_tasks.append(worker_task)
-
-        for name, proc in self._processes.items():
-            info = parts[name]
-            lf = self._log_file_handles.get(name)
-
-            # stdout reader task
-            out_task = asyncio.create_task(
-                self._read_service_output(name, proc, lf)
-            )
-            self._all_tasks.append(out_task)
-
-            # log file monitor task
-            mon_task = asyncio.create_task(
-                self._monitor_service(name, info["log_path"])
-            )
-            self._all_tasks.append(mon_task)
+        return True
 
     async def _read_service_output(
         self,
@@ -716,53 +566,34 @@ class REPLSession:
         log_file: Any,
     ) -> None:
         """Read subprocess stdout, print, tee to file, feed to trigger engine."""
-        _announced: set[str] = set()   # avoid printing same URL twice per service
-        while True:
-            if proc.stdout is None:
-                break
-            try:
-                line = await proc.stdout.readline()
-            except Exception:
-                break
-            if not line:
-                break
-
-            decoded = line.decode("utf-8", errors="replace").rstrip("\r\n")
-            if not decoded:
-                continue
-
+        announced: set[str] = set()   # avoid printing same URL twice per service
+        async for decoded in iter_lines(proc.stdout):
             clean = _ANSI_RE.sub("", decoded)
-            if not clean:
+            if not clean.strip():
                 continue
 
-            # Print to terminal AND update dashboard simultaneously
             print_service_log(name, clean)
-            if self._dashboard:
-                self._dashboard.append_log(name, clean)
-                self._dashboard.increment_lines(name)
 
-            if log_file:
+            if log_file and not log_file.closed:
                 log_file.write(clean + "\n")
                 log_file.flush()
 
             # --- Live URL detection: catch the real URL/port the server chose ---
             url_match = _URL_RE.search(clean)
             if url_match:
-                raw_url = url_match.group(1).rstrip("/")
-                # Normalise non-routable addresses to localhost
                 real_url = (
-                    raw_url
+                    url_match.group(1).rstrip("/")
                     .replace("0.0.0.0", "localhost")
-                    .replace("[::]" , "localhost")
+                    .replace("[::]", "localhost")
                     .replace("[::1]", "localhost")
                 )
-                if real_url not in _announced:
-                    _announced.add(real_url)
+                if real_url not in announced:
+                    announced.add(real_url)
                     console.print()
                     console.print(
                         Panel(
-                            f"[bold green]\U0001f310  {name}[/bold green]  is ready\n\n"
-                            f"   [bold white underline]{real_url}[/bold white underline]",
+                            f"[bold green]\U0001f310  {escape(name)}[/bold green]  is ready\n\n"
+                            f"   [bold white underline]{escape(real_url)}[/bold white underline]",
                             border_style="bright_green",
                             padding=(0, 2),
                             expand=False,
@@ -770,122 +601,46 @@ class REPLSession:
                     )
                     console.print()
 
-            # Feed to trigger engine
-            if self._buffer and self._engine:
-                log_obj = parse(clean, source=name, adapter="subprocess")
-                self._engine.evaluate(log_obj, self._buffer)  # type: ignore[union-attr]
-                self._buffer.push(log_obj)  # type: ignore[union-attr]
+            # Feed to trigger engine (evaluates BEFORE pushing to the buffer)
+            if self._monitor:
+                self._monitor.ingest(parse(clean, source=name, adapter="subprocess"))
 
-    async def _monitor_service(self, name: str, log_path: str) -> None:
-        """Tail a service log file and feed to trigger engine."""
-        adapter = FileAdapter(path=Path(log_path), poll_ms=100, source=name)
-        while True:
-            try:
-                async for log_obj in adapter.stream():
-                    if self._buffer and self._engine:
-                        self._engine.evaluate(log_obj, self._buffer)
-                        self._buffer.push(log_obj)
-            except FileNotFoundError:
-                await asyncio.sleep(0.5)
-            except asyncio.CancelledError:
-                break
-            except Exception:
-                await asyncio.sleep(0.5)
-
-    async def _agent_worker(
-        self,
-        queue: asyncio.Queue[dict[str, Any]],
-        agent: GeminiAgent,
-        on_finding: Any,
-    ) -> None:
-        """Consume agent queue, call LLM, invoke on_finding."""
-        while True:
-            try:
-                trigger_event = await asyncio.wait_for(queue.get(), timeout=5.0)
-            except asyncio.TimeoutError:
-                continue
-            except asyncio.CancelledError:
-                break
-
-            try:
-                finding = await agent.analyze(trigger_event)
-                await on_finding(finding)
-            except Exception as exc:
-                import logging
-                logging.getLogger("logwhisper").error("%s worker error: %s", "Nexus", exc)
-            finally:
-                queue.task_done()
+        console.print(f"[dim]{escape(name)} exited (code {proc.returncode}).[/dim]")
 
     # ── Dependency Check ────────────────────────────────────────────────────
 
     async def _check_and_install_deps(self, parts: dict[str, dict]) -> None:
-        """Check deps for all services, prompt or auto-install if missing."""
+        """Check deps for all services, prompt before installing anything."""
         from rich.prompt import Confirm
 
-        services_needing_deps: list[tuple[str, Path]] = []
+        needing: list[tuple[str, Path]] = []
         for name, info in parts.items():
             service_path = Path(info["path"])
-            result = check_service_deps(name, service_path)
-            if result.missing:
-                services_needing_deps.append((name, service_path))
+            if (await asyncio.to_thread(check_service_deps, name, service_path)).missing:
+                needing.append((name, service_path))
 
-        if not services_needing_deps:
+        if not needing:
             return
 
         console.print()
-        console.print(
-            f"[yellow]⚠ Dependencies may be missing for {len(services_needing_deps)} service(s).[/yellow]"
-        )
-        for name, path in services_needing_deps:
-            console.print(f"  [cyan]{name}[/cyan]  ({path})")
+        console.print(f"[yellow]⚠ Dependencies may be missing for {len(needing)} service(s).[/yellow]")
+        for name, path in needing:
+            console.print(f"  [cyan]{escape(name)}[/cyan]  ({escape(str(path))})")
 
         try:
-            answer = Confirm.ask("\nDependencies missing. Install now? (y/N)")
+            answer = await ainput(
+                lambda: Confirm.ask("\nDependencies missing. Install now?", default=False)
+            )
         except (KeyboardInterrupt, EOFError):
             console.print("\n[dim]Skipping install.[/dim]")
             return
 
         if answer:
-            await self._run_install(services_needing_deps)
-
-    async def _run_install(self, services_needing_deps: list[tuple[str, Path]]) -> None:
-        """Run install for each service."""
-        import subprocess
-
-        for name, path in services_needing_deps:
-            result = check_service_deps(name, path)
-            if result.manager == "unknown":
-                console.print(f"[dim]  {name}: no recognized package manager, skipping[/dim]")
-                continue
-
-            console.print(f"  [cyan]{name}[/cyan]  installing via {result.manager}...")
-
-            install_cmd = result.install_command()
-            try:
-                proc = subprocess.run(
-                    install_cmd,
-                    cwd=str(path),
-                    capture_output=True,
-                    text=True,
-                    timeout=300,
-                    shell=True,
-                )
-                if proc.returncode == 0:
-                    console.print(f"    [green]✓ {name} installed[/green]")
-                else:
-                    console.print(f"    [red]✗ {name} install failed[/red]")
-                    if proc.stderr:
-                        console.print(f"      [dim]{proc.stderr[:200]}[/dim]")
-            except subprocess.TimeoutExpired:
-                console.print(f"    [red]✗ {name} install timed out[/red]")
-            except FileNotFoundError:
-                console.print(f"    [red]✗ {result.manager} not found — is it installed?[/red]")
+            await asyncio.to_thread(run_install, needing, console)
 
     # ── UI Helpers ──────────────────────────────────────────────────────────
 
     def _print_banner(self) -> None:
-        import os
-
         show_splash(
             console=console,
             api_key=self._api_key,
@@ -904,9 +659,8 @@ class REPLSession:
             console.print("[dim]No services running.[/dim]")
             return
         for name, proc in self._processes.items():
-            alive = proc.returncode is None
-            status = "[green]running[/green]" if alive else "[red]stopped[/red]"
-            console.print(f"  [cyan]{name}[/cyan]  {status}  (PID {proc.pid})")
+            status = "[green]running[/green]" if proc.returncode is None else "[red]stopped[/red]"
+            console.print(f"  [cyan]{escape(name)}[/cyan]  {status}  (PID {proc.pid})")
         console.print()
 
     def _print_goodbye(self) -> None:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 from pathlib import Path
 from typing import Literal
 
@@ -42,13 +43,22 @@ def _node_dev_script(path: Path) -> str | None:
     try:
         with open(pkg, encoding="utf-8") as f:
             data = json.load(f)
-        scripts = data.get("scripts", {})
+        scripts = data.get("scripts") if isinstance(data, dict) else None
+        if not isinstance(scripts, dict):
+            return None
         for script in ("dev", "start", "serve"):
             if script in scripts:
                 return script
-    except (json.JSONDecodeError, OSError):
-        pass
-    return "dev"   # assume dev even if we can't read the file
+        return None   # readable package.json with no runnable script
+    except (ValueError, OSError):
+        return "dev"   # can't read the file — assume dev
+
+
+def _python_cmd() -> str:
+    """'python' if available, else 'python3' (macOS/Linux often only ship the latter)."""
+    if shutil.which("python") is None and shutil.which("python3") is not None:
+        return "python3"
+    return "python"
 
 
 # ---------------------------------------------------------------------------
@@ -127,20 +137,21 @@ def detect_dev_command(project_type: ProjectType, path: Path | None = None) -> s
             return f'pnpm --dir "{path}" run {script}'
 
     elif project_type == "python":
+        py = _python_cmd()
         for entrypoint in ["main.py", "app.py", "server.py", "manage.py", "run.py"]:
             ep = path / entrypoint
             if ep.exists():
                 # Django
                 if entrypoint == "manage.py":
-                    return f'python -u "{ep}" runserver'
+                    return f'{py} -u "{ep}" runserver'
                 # FastAPI / uvicorn hint
                 if entrypoint in ("main.py", "app.py"):
                     # check if uvicorn is likely used
                     src = ep.read_text(encoding="utf-8", errors="ignore")
                     if "uvicorn" in src or "FastAPI" in src or "fastapi" in src:
                         module = ep.stem  # "main" or "app"
-                        return f'python -m uvicorn {module}:app --reload --app-dir "{path}"'
-                return f'python -u "{ep}"'
+                        return f'{py} -m uvicorn {module}:app --reload --app-dir "{path}"'
+                return f'{py} -u "{ep}"'
         return None
 
     elif project_type == "go":
@@ -150,7 +161,7 @@ def detect_dev_command(project_type: ProjectType, path: Path | None = None) -> s
         cmd_dirs = list((path / "cmd").glob("*/main.go")) if (path / "cmd").is_dir() else []
         if cmd_dirs:
             return f'go run "{cmd_dirs[0]}"'
-        return f'go run .'
+        return 'go run .'
 
     elif project_type == "rust":
         return f'cargo run --manifest-path "{path / "Cargo.toml"}"'
@@ -168,7 +179,7 @@ def detect_dev_command(project_type: ProjectType, path: Path | None = None) -> s
 
     elif project_type == "ruby":
         if (path / "config.ru").exists():
-            return f'bundle exec rails server -b 0.0.0.0'
+            return 'bundle exec rails server -b 0.0.0.0'
         return f'bundle exec ruby "{path / "app.rb"}"' if (path / "app.rb").exists() else None
 
     elif project_type == "php":
@@ -185,7 +196,7 @@ def detect_dev_command(project_type: ProjectType, path: Path | None = None) -> s
     elif project_type == "static":
         # Use Python's built-in HTTP server — zero extra installs needed.
         # Serves index.html at http://localhost:3000
-        return f'python -m http.server 3000 --directory "{path}"'
+        return f'{_python_cmd()} -m http.server 3000 --directory "{path}"'
 
     return None
 
@@ -354,6 +365,8 @@ def detect_package_manager(path: Path) -> tuple[str, str | None]:
         return ("yarn", None)
     if (path / "pnpm-lock.yaml").exists():
         return ("pnpm", None)
+    if (path / "package.json").exists():
+        return ("npm", None)   # no lock file yet — still a Node project
 
     if (path / "requirements.txt").exists():
         return ("pip", "requirements.txt")
