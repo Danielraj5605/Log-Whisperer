@@ -6,19 +6,17 @@ import time
 from collections import deque
 from typing import Any
 
-from rich.console import Console
 from rich.layout import Layout
 from rich.live import Live
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from output.terminal import _get_service_color
+from output import _fmt
+from output.terminal import _get_service_color, console, service_prefix
 
 # Agent identity — used in dashboard UI and logging
 AGENT_NAME = "Nexus"
-
-console = Console()
 
 
 class Dashboard:
@@ -46,6 +44,8 @@ class Dashboard:
 
     def start(self) -> None:
         """Start the live dashboard display."""
+        if self._live is not None:
+            return
         self._live = Live(
             self._render(),
             console=console,
@@ -70,8 +70,6 @@ class Dashboard:
     def add_alert(self, finding: dict[str, Any]) -> None:
         """Add an alert to the history panel."""
         self._alerts.appendleft(finding)
-        if len(self._alerts) > 5:
-            self._alerts.pop()
         self._refresh()
 
     def increment_errors(self, service: str) -> None:
@@ -105,12 +103,16 @@ class Dashboard:
 
     def _render(self) -> Layout:
         layout = Layout()
-        layout.split_row(
-            Layout(self._render_services_panel(), name="services"),
-            Layout(self._render_metrics_panel(), name="metrics"),
+        top = Layout(name="top", size=9)
+        top.split_row(
+            Layout(self._render_services_panel(), name="services", ratio=2),
+            Layout(self._render_metrics_panel(), name="metrics", ratio=1),
         )
-        layout.split_row(Layout(self._render_log_panel(), name="logs"))
-        layout.split_row(Layout(self._render_alerts_panel(), name="alerts"))
+        layout.split_column(
+            top,
+            Layout(self._render_log_panel(), name="logs", ratio=3),
+            Layout(self._render_alerts_panel(), name="alerts", size=9),
+        )
         return layout
 
     def _render_services_panel(self) -> Panel:
@@ -121,16 +123,15 @@ class Dashboard:
             status = self._service_status.get(svc, "⏳")
             err = self._service_errors.get(svc, 0)
             lines = self._service_lines.get(svc, 0)
-            color = _get_service_color(svc)
             table.add_row(
-                f"[{color}]{svc}[/{color}]",
+                Text(svc, style=_get_service_color(svc)),
                 f"{status}  ·  {lines} lines  ·  {err} errors",
             )
         return Panel(
             table,
             title=f" Services ({len(self._services)}) — 🔷 {AGENT_NAME} ",
             border_style="cyan",
-            padding=(1, 2),
+            padding=(0, 2),
         )
 
     def _render_metrics_panel(self) -> Panel:
@@ -145,7 +146,7 @@ class Dashboard:
         table.add_row("Total errors", f"[red]{self._total_errors}[/red]")
         table.add_row("Uptime", f"[dim]{uptime}[/dim]")
         table.add_row("Services", f"{len(self._services)}")
-        return Panel(table, title=f" {AGENT_NAME} ", border_style="cyan", padding=(1, 2))
+        return Panel(table, title=f" {AGENT_NAME} ", border_style="cyan", padding=(0, 2))
 
     def _render_log_panel(self) -> Panel:
         if not self._logs:
@@ -153,32 +154,22 @@ class Dashboard:
         else:
             text = Text()
             for svc, line in self._logs:
-                color = _get_service_color(svc)
-                text.append(f"[{color}][{svc}][/{color}]  ", style=color)
+                text.append_text(service_prefix(svc))
+                text.append("  ")
                 text.append(line[:200])
                 text.append("\n")
-            if text.plain.endswith("\n"):
-                text._text = text._text[:-1]
-        return Panel(
-            text,
-            title=" Live Logs ",
-            border_style="cyan",
-            padding=(1, 1),
-            height=20,
-        )
+            text.rstrip()
+        return Panel(text, title=" Live Logs ", border_style="cyan", padding=(0, 1))
 
     def _render_alerts_panel(self) -> Panel:
         if not self._alerts:
             text = Text("No alerts yet", style="dim")
-            return Panel(text, title=" Alert History ", border_style="cyan", padding=(1, 1))
+            return Panel(text, title=" Alert History ", border_style="cyan", padding=(0, 1))
         table = Table(box=None, show_header=False, padding=(0, 1))
         for alert in self._alerts:
-            confidence = alert.get("confidence", "medium").lower()
-            trigger = alert.get("trigger", "")
-            source = alert.get("source", "unknown")
-            root = alert.get("root_signal", "")[:50]
-            emoji = "🔴" if confidence == "high" else "🟡"
-            table.add_row(
-                f"{emoji} [cyan]{source}[/cyan]  {trigger}  {root}"
-            )
-        return Panel(table, title=" Alert History ", border_style="cyan", padding=(1, 1))
+            emoji = "🔴" if _fmt.confidence(alert) == "high" else "🟡"
+            row = Text(f"{emoji} ")
+            row.append(_fmt.text(alert, "source", "unknown"), style="cyan")
+            row.append(f"  {_fmt.text(alert, 'trigger')}  {_fmt.text(alert, 'root_signal', '', 50)}")
+            table.add_row(row)
+        return Panel(table, title=" Alert History ", border_style="cyan", padding=(0, 1))

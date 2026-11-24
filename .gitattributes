@@ -1,0 +1,4 @@
+# Shell scripts must keep LF endings or bash fails on "\r"; batch files want CRLF.
+*.sh  text eol=lf
+*.bat text eol=crlf
+*.py  text eol=lf

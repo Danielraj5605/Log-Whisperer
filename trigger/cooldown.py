@@ -2,30 +2,25 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    pass
+import time
+from typing import Callable
 
 
 class CooldownTracker:
     """Tracks the last fire time for each (rule, source) pair."""
 
-    def __init__(self) -> None:
-        self._last_fired: dict[tuple[str, str], datetime] = {}
+    def __init__(self, clock: Callable[[], float] | None = None) -> None:
+        self._clock = clock or time.monotonic
+        self._last_fired: dict[tuple[str, str], float] = {}
 
-    def is_cooling(self, rule: str, source: str, cooldown_seconds: int) -> bool:
-        key = (rule, source)
-        last = self._last_fired.get(key)
+    def is_cooling(self, rule: str, source: str, cooldown_seconds: float) -> bool:
+        last = self._last_fired.get((rule, source))
         if last is None:
             return False
-        elapsed = (datetime.now(timezone.utc) - last).total_seconds()
-        return elapsed < cooldown_seconds
+        return (self._clock() - last) < cooldown_seconds
 
     def record(self, rule: str, source: str) -> None:
-        key = (rule, source)
-        self._last_fired[key] = datetime.now(timezone.utc)
+        self._last_fired[(rule, source)] = self._clock()
 
     def reset(self) -> None:
         self._last_fired.clear()

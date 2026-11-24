@@ -8,12 +8,13 @@ Unlike traditional log monitoring tools that match static rules, Log Whisperer *
 
 ## Features
 
-- **Live log tailing** — file, Docker containers, or stdin pipe
-- **AI-powered analysis** — Gemini / Claude / GPT-4o / Ollama
+- **Live log tailing** — files, Docker containers, or a stdin pipe
+- **AI-powered analysis** — Google Gemini (default `gemini-2.5-flash`)
 - **Windows toast notifications** — get alerted even when the terminal is minimized
 - **Rich terminal UI** — color-coded alerts with evidence, action, and blast radius
 - **Smart triggering** — only wakes the LLM when something is actually wrong (not every log line)
 - **Cooldown suppression** — 200 identical errors = 1 alert with a suppressed count
+- **Batch analysis** — replay an existing log file through the same rules (`logwhisper analyze`)
 - **Local-first** — no cloud infra required, just a Gemini API key
 
 ---
@@ -24,7 +25,7 @@ Unlike traditional log monitoring tools that match static rules, Log Whisperer *
 - A free [Gemini API key](https://aistudio.google.com/app/apikey)
 - Windows, macOS, or Linux
 
-> **Note:** Windows toast notifications require the `winotify` package (installed automatically). On macOS/Linux, notifications are terminal-only.
+> **Note:** Windows toast notifications use native Windows Runtime bindings (installed automatically on Windows only). On macOS/Linux, notifications are terminal-only.
 
 ---
 
@@ -33,8 +34,8 @@ Unlike traditional log monitoring tools that match static rules, Log Whisperer *
 ### Windows
 
 ```bat
-git clone https://github.com/your-username/log-whisperer.git
-cd log-whisperer
+git clone https://github.com/Danielraj5605/Log-Whisperer.git
+cd Log-Whisperer
 setup.bat
 ```
 
@@ -47,13 +48,13 @@ setup.bat
 ### macOS / Linux
 
 ```bash
-git clone https://github.com/your-username/log-whisperer.git
-cd log-whisperer
+git clone https://github.com/Danielraj5605/Log-Whisperer.git
+cd Log-Whisperer
 chmod +x setup.sh
 ./setup.sh
 ```
 
-Same steps as above — just double-run `source .venv/bin/activate` in each new terminal session before using `logwhisper`.
+Same steps as above — run `source .venv/bin/activate` in each new terminal session before using `logwhisper`.
 
 ---
 
@@ -108,7 +109,7 @@ logwhisper watch --file ./test.log
 logwhisper watch --file ./logs/app.log --file ./logs/auth.log
 ```
 
-### Watch with a custom trigger threshold
+### Watch with a larger line buffer
 
 ```bash
 logwhisper watch --file ./logs/app.log --buffer 1000
@@ -118,6 +119,24 @@ logwhisper watch --file ./logs/app.log --buffer 1000
 
 ```bash
 logwhisper watch --file ./logs/app.log --no-notification
+```
+
+### Watch a Docker container
+
+```bash
+logwhisper watch --docker my-container
+```
+
+### Watch piped output
+
+```bash
+kubectl logs -f my-pod | logwhisper watch --stdin
+```
+
+### Analyze an existing log file
+
+```bash
+logwhisper analyze --file ./logs/incident.log --since 2026-04-08T10:00:00
 ```
 
 ---
@@ -166,10 +185,12 @@ logwhisper watch [OPTIONS]
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--file`, `-f` | — | Log file(s) to tail |
+| `--file`, `-f` | — | Log file(s) to tail (repeatable) |
+| `--docker`, `-d` | — | Docker container(s) to follow (repeatable) |
+| `--stdin` | false | Read log lines piped into `logwhisper` |
 | `--poll` | 100 | File polling interval (ms) |
 | `--buffer`, `-b` | 500 | Ring buffer max lines |
-| `--model` | gemini-2.5-flash | LLM model name |
+| `--model` | from config (`gemini-2.5-flash`) | LLM model name |
 | `--api-key` | env/GEMINI_API_KEY | Gemini API key |
 | `--no-notification` | false | Disable Windows toast |
 | `--no-telegram` | false | Disable Telegram alerts |
@@ -180,7 +201,14 @@ logwhisper watch [OPTIONS]
 logwhisper analyze --file ./logs/incident.log
 ```
 
-> Batch analysis is planned — currently use `watch` for live analysis.
+Replays the file through the trigger rules using the log's own timestamps, then asks the LLM about each anomaly.
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--file` | — | Log file to analyze (required) |
+| `--since`, `--until` | — | Only lines in this ISO 8601 range (naive times = local time) |
+| `--max-alerts` | 10 | Maximum number of anomalies sent to the LLM |
+| `--model`, `--api-key` | | As for `watch` |
 
 ### `telegram` — Manage Telegram alerts
 
@@ -191,6 +219,37 @@ logwhisper telegram clear    # Remove Telegram config
 ```
 
 ---
+
+## Local analysis and privacy
+
+Use `logwhisper watch --stdin --local` to detect anomalies without a key. The same
+flag works with `analyze`, `shell` and `run`. Local mode produces a rule finding and
+keeps Gemini and Telegram offline. The interactive monitor uses local analysis when
+no key is configured. Use `/run --local` or `/watch --local path/to/app.log` to force local mode. Use `/status` in the REPL for queue and delivery counts.
+
+Automatic Gemini findings include context from the triggering source. Chat includes
+the supplied question and any explicitly selected log file. Use
+`logwhisper chat --preview --file app.log --error "Why did this fail?"` to inspect
+the sanitized context locally. Redaction covers common credential fields, authorization
+headers, email addresses and configured provider keys. Use local analysis for data
+that must stay on the machine.
+
+Additional project settings in `.logwhisper.yaml`:
+
+```yaml
+privacy:
+  project_context: false   # opt in to project snippets and package metadata for chat
+  chat_service_logs: false # opt in to recent service logs for REPL chat
+storage:
+  capture_logs: true       # persist redacted managed-service and shell logs
+  max_bytes: 10485760      # rotate before appending a record past this size
+  backups: 3               # number of rotated files retained per log or findings file
+```
+
+Log rotation keeps complete records, so one oversized record may exceed the rollover
+size. A watch summary reports accepted, pending, dropped and suppressed work,
+source failures, and delivery counts per sink. Static previews bind to loopback
+and serve web assets, preferring a `public/` directory containing an index page.
 
 ## Configuration
 
@@ -208,23 +267,37 @@ buffer:
   max_lines: 500
   context_window_seconds: 60
 
-triggers:
+triggers:                      # every rule accepts `enabled` and `cooldown_seconds`
   rate_spike:
     enabled: true
     threshold: 5
     window_seconds: 10
-    cooldown_seconds: 60
+    cooldown_seconds: 30
   new_error_type:
     enabled: true
-    cooldown_seconds: 300
+    cooldown_seconds: 5
   critical_keyword:
     enabled: true
-    cooldown_seconds: 120
+    cooldown_seconds: 30
+    extra_keywords: []
+  http_error:
+    enabled: true
+  metric_threshold:
+    enabled: true
+    thresholds: {latency_ms: 2000, cpu_pct: 90, memory_pct: 85}
+  cluster_formation:
+    enabled: true
+  silence_anomaly:
+    enabled: true
+    silence_threshold_seconds: 60
 
 output:
   terminal: true
+  jsonl: {enabled: true, path: .logwhisper/alerts.jsonl}
   windows_notification: true
 ```
+
+`${ENV_VAR}` references are expanded, so the API key never has to be written into the file. The API key is looked up in: `--api-key` → `GEMINI_API_KEY` → `logwhisper setup` credentials → `llm.api_key`. Because a project config can hold secrets, `.logwhisper.yaml` is **not** git-ignored by default — keep keys out of it via `${GEMINI_API_KEY}`.
 
 ---
 
@@ -245,6 +318,9 @@ log-whisperer/
 │   ├── chat.py                # Interactive chat agent
 │   ├── deps.py                # Dependency checker
 │   ├── detect.py              # Project type detection
+│   ├── gemini_client.py       # Shared Gemini HTTP client (retries, safe errors)
+│   ├── pipeline.py            # Buffer + rules + LLM + outputs wiring
+│   ├── procs.py               # Subprocess / terminal-input helpers
 │   ├── repl.py                # Interactive REPL session
 │   ├── run.py                 # Auto-detect & run session
 │   ├── session.py             # API key & config management
@@ -256,11 +332,12 @@ log-whisperer/
 │   └── ring_buffer.py         # Sliding window + frequency tracking
 │
 ├── ingest/
-│   └── file_adapter.py        # Async file tail with rotation detection
+│   ├── file_adapter.py        # Async file tail with rotation/truncation detection
+│   └── stream_adapters.py     # Docker and stdin sources
 │
 ├── trigger/
 │   ├── engine.py              # Rule evaluation loop
-│   ├── rules.py               # 6 trigger rule types
+│   ├── rules.py               # 7 trigger rule types
 │   └── cooldown.py            # Per-(rule, source) cooldown tracker
 │
 └── output/
@@ -289,10 +366,11 @@ Log File → [File Adapter] → [Ring Buffer] → [Trigger Engine] → [Agent Qu
 |------|-----------|
 | `NewErrorTypeRule` | First appearance of an error signature this session |
 | `RateSpikeRule` | Error rate exceeds threshold (default: 5/10s) |
-| `CriticalKeywordRule` | Fatal/OOM/panic/deadlock keywords detected |
+| `CriticalKeywordRule` | Fatal/OOM/panic/deadlock keywords detected (whole words only) |
+| `HttpErrorRule` | A new 4xx/5xx status appears on an HTTP access/error line |
 | `MetricThresholdRule` | latency_ms / cpu_pct / memory_pct exceeds limit |
 | `ClusterFormationRule` | Errors from 3+ sources in 30s window |
-| `SilenceAnomalyRule` | Active source stops emitting for 60s+ |
+| `SilenceAnomalyRule` | A source resumes logging after 60s+ of silence |
 
 ---
 
@@ -312,24 +390,16 @@ When an alert fires, you see:
 ╚══════════════════════════════════════════════════════════╝
 ```
 
-Plus a Windows toast notification with the same info.
+Plus a Windows toast notification with the same info. If several rules match the same line they are merged into one alert (one LLM call).
 
 ---
 
-## Supported LLM Providers
+## LLM Provider
+
+Log Whisperer uses **Google Gemini** only. Choose the model with `--model` or `llm.model` in the config:
 
 ```bash
-# Gemini (default)
 logwhisper watch --file ./logs/app.log --model gemini-2.5-flash
-
-# OpenAI GPT-4o
-logwhisper watch --file ./logs/app.log --model gpt-4o
-
-# Anthropic Claude
-logwhisper watch --file ./logs/app.log --model claude-sonnet-4-20250514
-
-# Ollama (local)
-logwhisper watch --file ./logs/app.log --model llama3
 ```
 
 ---
@@ -387,7 +457,7 @@ Download the latest Python from: https://www.python.org/downloads/
 
 ### ❌ Toast notifications not showing
 
-- Make sure `winotify` is installed: `pip install winotify`
+- Toasts are Windows-only; install the Windows dependencies with `python -m pip install -e .`
 - Check Windows notification settings → ensure notifications are enabled for your terminal app
 
 ### ❌ File not being tailed

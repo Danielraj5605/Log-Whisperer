@@ -1,64 +1,46 @@
-"""Windows toast notifications via winotify."""
+"""Windows toast notifications using the Windows Runtime."""
 
 from __future__ import annotations
 
-import logging
+import sys
 from typing import Any
+from xml.etree import ElementTree as ET
 
-try:
-    import winotify
-    WINOTIFY_AVAILABLE = True
-except ImportError:
-    WINOTIFY_AVAILABLE = False
-
-logger = logging.getLogger(__name__)
-
+from output import _fmt
 
 class WindowsNotifier:
-    """Send Windows toast notifications when an alert fires."""
-
-    def __init__(self) -> None:
-        self._available = WINOTIFY_AVAILABLE
-        if not self._available:
-            logger.warning("winotify not installed — Windows notifications disabled")
+    """Build a toast using XML text nodes and the native Windows Runtime."""
 
     def notify(self, finding: dict[str, Any]) -> None:
-        """
-        Show a Windows toast notification for an alert finding.
-
-        Args:
-            finding: Structured alert dict from the agent.
-        """
-        if not self._available:
+        if sys.platform != "win32":
             return
+        from winrt.windows.data.xml.dom import XmlDocument
+        from winrt.windows.ui.notifications import ToastNotification, ToastNotificationManager
 
-        title = self._title(finding)
-        body = self._body(finding)
+        document = XmlDocument()
+        document.load_xml(self._xml(finding))
+        ToastNotificationManager.create_toast_notifier("Log Whisperer").show(ToastNotification(document))
 
-        try:
-            toast = winotify.Winotify(
-                app_id="Log Whisperer",
-                title=title,
-                text=body,
-            )
-            toast.show()
-        except Exception as exc:
-            logger.error("Failed to show Windows notification: %s", exc)
+    def _xml(self, finding: dict[str, Any]) -> str:
+        root = ET.Element("toast")
+        binding = ET.SubElement(ET.SubElement(root, "visual"), "binding", template="ToastGeneric")
+        for value in (self._title(finding), self._body(finding)):
+            ET.SubElement(binding, "text").text = value
+        return ET.tostring(root, encoding="unicode")
 
     def _title(self, finding: dict[str, Any]) -> str:
-        confidence = finding.get("confidence", "medium").upper()
-        source = finding.get("source", "unknown")
-        trigger = finding.get("trigger", "alert")
-        emoji = "🔴" if confidence == "HIGH" else "🟡" if confidence == "MEDIUM" else "🔵"
+        confidence = _fmt.confidence(finding)
+        source = _fmt.text(finding, "source", "unknown")
+        trigger = _fmt.text(finding, "trigger", "alert")
+        emoji = "🔴" if confidence == "high" else "🟡" if confidence == "medium" else "🔵"
         return f"{emoji} Log Whisperer — {trigger} ({source})"
 
     def _body(self, finding: dict[str, Any]) -> str:
-        root = finding.get("root_signal", "unknown")[:100]
-        caused = finding.get("caused_by", "")
-        action = finding.get("action", "")
-        lines = [root]
+        lines = [_fmt.text(finding, "root_signal", "unknown", 100)]
+        caused = _fmt.text(finding, "caused_by", "", 100)
+        action = _fmt.text(finding, "action", "", 100)
         if caused:
-            lines.append(caused[:100])
+            lines.append(caused)
         if action:
-            lines.append(f"→ {action[:100]}")
+            lines.append(f"→ {action}")
         return "\n".join(lines)

@@ -15,7 +15,7 @@ async def agent_worker(
     queue: asyncio.Queue[dict[str, Any]],
     agent,  # GeminiAgent or similar
     on_finding: Callable[[dict[str, Any]], Coroutine[Any, Any, None]],
-    suppressed_ref: list[int],
+    suppressed_ref: list[int] | None = None,
 ) -> None:
     """
     Background worker that:
@@ -27,18 +27,18 @@ async def agent_worker(
         queue: asyncio.Queue of trigger events
         agent: LLM agent (must have .analyze(trigger_event) -> dict method)
         on_finding: async callback to handle each finding
-        suppressed_ref: shared list [suppressed_count] for updates
+        suppressed_ref: optional shared list [suppressed_count]; copied into each finding
+            (on_finding may overwrite it with a fresher value)
     """
     while True:
-        try:
-            trigger_event = await asyncio.wait_for(queue.get(), timeout=5.0)
-        except asyncio.TimeoutError:
-            continue
-
+        trigger_event = await queue.get()
         try:
             finding = await agent.analyze(trigger_event)
-            finding["suppressed_count"] = suppressed_ref[0]
+            if suppressed_ref:
+                finding["suppressed_count"] = suppressed_ref[0]
             await on_finding(finding)
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:
             logger.error("%s worker error: %s", AGENT_NAME, exc)
         finally:
