@@ -44,7 +44,7 @@ class FileAdapter:
                 if f is None:
                     try:
                         f = open(self._path, "rb")
-                    except OSError:
+                    except FileNotFoundError:
                         # Not there (yet) — a file that appears later is read from the start
                         first_open = False
                         await asyncio.sleep(delay)
@@ -71,7 +71,7 @@ class FileAdapter:
                 # Caught up. Check for truncation, rotation or deletion.
                 try:
                     st = os.stat(self._path)
-                except OSError:
+                except FileNotFoundError:
                     f.close()
                     f = None
                     await asyncio.sleep(delay)

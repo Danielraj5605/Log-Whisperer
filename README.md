@@ -25,7 +25,7 @@ Unlike traditional log monitoring tools that match static rules, Log Whisperer *
 - A free [Gemini API key](https://aistudio.google.com/app/apikey)
 - Windows, macOS, or Linux
 
-> **Note:** Windows toast notifications use the `winotify` package (installed automatically on Windows only). On macOS/Linux, notifications are terminal-only.
+> **Note:** Windows toast notifications use native Windows Runtime bindings (installed automatically on Windows only). On macOS/Linux, notifications are terminal-only.
 
 ---
 
@@ -109,7 +109,7 @@ logwhisper watch --file ./test.log
 logwhisper watch --file ./logs/app.log --file ./logs/auth.log
 ```
 
-### Watch with a custom trigger threshold
+### Watch with a larger line buffer
 
 ```bash
 logwhisper watch --file ./logs/app.log --buffer 1000
@@ -219,6 +219,37 @@ logwhisper telegram clear    # Remove Telegram config
 ```
 
 ---
+
+## Local analysis and privacy
+
+Use `logwhisper watch --stdin --local` to detect anomalies without a key. The same
+flag works with `analyze`, `shell` and `run`. Local mode produces a rule finding and
+keeps Gemini and Telegram offline. The interactive monitor uses local analysis when
+no key is configured. Use `/run --local` or `/watch --local path/to/app.log` to force local mode. Use `/status` in the REPL for queue and delivery counts.
+
+Automatic Gemini findings include context from the triggering source. Chat includes
+the supplied question and any explicitly selected log file. Use
+`logwhisper chat --preview --file app.log --error "Why did this fail?"` to inspect
+the sanitized context locally. Redaction covers common credential fields, authorization
+headers, email addresses and configured provider keys. Use local analysis for data
+that must stay on the machine.
+
+Additional project settings in `.logwhisper.yaml`:
+
+```yaml
+privacy:
+  project_context: false   # opt in to project snippets and package metadata for chat
+  chat_service_logs: false # opt in to recent service logs for REPL chat
+storage:
+  capture_logs: true       # persist redacted managed-service and shell logs
+  max_bytes: 10485760      # rotate before appending a record past this size
+  backups: 3               # number of rotated files retained per log or findings file
+```
+
+Log rotation keeps complete records, so one oversized record may exceed the rollover
+size. A watch summary reports accepted, pending, dropped and suppressed work,
+source failures, and delivery counts per sink. Static previews bind to loopback
+and serve web assets, preferring a `public/` directory containing an index page.
 
 ## Configuration
 
@@ -426,7 +457,7 @@ Download the latest Python from: https://www.python.org/downloads/
 
 ### ❌ Toast notifications not showing
 
-- Toasts are Windows-only; make sure `winotify` is installed: `pip install winotify`
+- Toasts are Windows-only; install the Windows dependencies with `python -m pip install -e .`
 - Check Windows notification settings → ensure notifications are enabled for your terminal app
 
 ### ❌ File not being tailed

@@ -6,6 +6,8 @@ import json
 import re
 import shutil
 import subprocess
+
+from agent.procs import child_environment
 import sys
 import tomllib
 from importlib import metadata
@@ -114,6 +116,7 @@ def _run_install(cmd: list[str], path: Path) -> bool:
         result = subprocess.run(
             cmd,
             cwd=str(path),
+            env=child_environment(),
             capture_output=True,
             text=True,
             timeout=300,

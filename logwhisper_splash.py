@@ -65,7 +65,7 @@ def show_splash(
     if api_key:
         # Never print the start of a key; the last 4 characters are enough to recognise it
         key_preview = f"...{api_key[-4:]} [{provider}]" if len(api_key) > 8 else f"[{provider}]"
-        key_line = Text(f"[+] key active  {key_preview}", style="green")
+        key_line = Text(f"[+] key configured  {key_preview}", style="green")
     else:
         key_line = Text("[!] no API key -- run /setup", style="red")
 

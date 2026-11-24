@@ -50,13 +50,15 @@ def _setup_logging() -> None:
     logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
-def _resolve_api_key(cli_key: str | None) -> str:
+def _resolve_api_key(cli_key: str | None, local: bool = False) -> str:
     """CLI flag > GEMINI_API_KEY > saved credentials > project config. Exits if none."""
     from agent.session import get_api_key
 
+    if local:
+        return ""
     key = (cli_key or "").strip() or get_api_key() or ""
     if not key:
-        log.error("No API key found. Set GEMINI_API_KEY, pass --api-key, or run `logwhisper setup`.")
+        log.error("No API key found. Set GEMINI_API_KEY, pass --local for rules-only monitoring, or run `logwhisper setup`.")
         raise typer.Exit(1)
     return key
 
@@ -76,6 +78,7 @@ def main_callback(ctx: typer.Context) -> None:
 
 @app.command()
 def run(
+    local: bool = typer.Option(False, "--local", help="Analyze with local rules and disable remote delivery"),
     cwd: Path | None = typer.Option(None, "--cwd", help="Project root directory"),
     auto_install: bool = typer.Option(
         False, "--auto-install", help="Automatically install missing dependencies without prompting"
@@ -100,7 +103,7 @@ def run(
     final_skip_check = skip_deps_check or bool(deps_cfg.get("skip_check", False))
 
     try:
-        asyncio.run(run_session(auto_install=final_auto_install, skip_deps_check=final_skip_check))
+        asyncio.run(run_session(auto_install=final_auto_install, skip_deps_check=final_skip_check, local=local))
     except KeyboardInterrupt:
         pass
 
@@ -189,6 +192,7 @@ def _launch_linux_terminal(cmd_str: str, cwd: Path, project_name: str) -> subpro
 
 @app.command()
 def shell(
+    local: bool = typer.Option(False, "--local", help="Analyze with local rules and disable remote delivery"),
     log_file: str | None = typer.Option(
         None, "--log-file", help="Log file path (overrides config default)"
     ),
@@ -202,29 +206,28 @@ def shell(
     from agent.pipeline import Monitor
     from agent.shell import Shell
     from config import load as load_config
-    from ingest.file_adapter import FileAdapter
+    from buffer.parser import parse
 
-    key = _resolve_api_key(api_key)
+    key = _resolve_api_key(api_key, local)
     cfg = load_config()
     default_files = cfg.get("watch", {}).get("default_files") or []
     log_path = log_file or (default_files[0] if default_files else "./logs/app.log")
 
     async def main() -> None:
         monitor = Monitor(key, cfg=cfg, model=model, windows_notifications=not no_notification)
-        tasks = [
-            monitor.start_worker(),
-            # Monitor the file the shell tees into. Existing history is skipped; a file the
-            # first command creates later is read from the top.
-            asyncio.create_task(
-                monitor.consume(FileAdapter(path=Path(log_path), poll_ms=100))
-            ),
-        ]
+        monitor.start_worker()
+        path = Path(log_path)
+
+        def consume_line(line: str) -> None:
+            monitor.ingest(parse(line, source=path.name, adapter="subprocess"))
+            monitor.capture(path, line)
+
         try:
-            await Shell(log_path=log_path).shell_loop(log_path=log_path)
+            await Shell(log_path=path, on_line=consume_line).shell_loop()
         finally:
-            for t in tasks:
-                t.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
+            await monitor.finish()
+        if monitor.degraded:
+            raise typer.Exit(1)
 
     try:
         asyncio.run(main())
@@ -235,6 +238,7 @@ def shell(
 
 @app.command()
 def watch(
+    local: bool = typer.Option(False, "--local", help="Analyze with local rules and disable remote delivery"),
     file: list[Path] = typer.Option(
         None, "--file", "-f", help="Log file(s) to tail"
     ),
@@ -245,10 +249,10 @@ def watch(
         False, "--stdin", help="Read log lines piped into logwhisper"
     ),
     poll_ms: int = typer.Option(
-        100, "--poll", help="File polling interval in milliseconds"
+        100, "--poll", min=1, help="File polling interval in milliseconds"
     ),
-    buffer_size: int = typer.Option(
-        BUFFER_MAXLEN, "--buffer", "-b", help="Ring buffer max lines"
+    buffer_size: int | None = typer.Option(
+        None, "--buffer", "-b", min=1, help="Ring buffer max lines"
     ),
     model: str | None = typer.Option(
         None, "--model", help="Gemini model name (default: from config, else gemini-2.5-flash)"
@@ -269,7 +273,7 @@ def watch(
     from ingest.file_adapter import FileAdapter
     from ingest.stream_adapters import DockerAdapter, StdinAdapter
 
-    key = _resolve_api_key(api_key)
+    key = _resolve_api_key(api_key, local)
     cfg = load_config()
 
     files = list(file or [])
@@ -285,11 +289,13 @@ def watch(
     for f in missing:
         log.warning("%s does not exist yet — will start tailing when it appears", f)
 
-    # Sources are keyed by name, so two files called app.log in different folders would be
-    # merged into one source (shared cooldowns and counters). Disambiguate with the parent.
+    files = list(dict.fromkeys(f.resolve() for f in files))
+    containers = list(dict.fromkeys(containers))
     names = [f.name for f in files]
-    sources = [f"{f.parent.name}/{f.name}" if names.count(f.name) > 1 else f.name for f in files]
-    sources += containers
+    reserved = {"stdin", *(f"docker:{name}" for name in containers)}
+    sources = [str(f) if names.count(f.name) > 1 or f.name in reserved
+               else f.name for f in files]
+    sources += [f"docker:{name}" for name in containers]
     if stdin:
         sources.append("stdin")
 
@@ -312,25 +318,19 @@ def watch(
         if stdin:
             adapters.append(StdinAdapter())
 
-        worker = monitor.start_worker()
+        monitor.start_worker()
         readers = [asyncio.create_task(monitor.consume(a)) for a in adapters]
         try:
             # File tails run forever; docker/stdin sources end on their own. If every source
             # has ended there is nothing left to watch, so drain pending alerts and exit.
             await asyncio.gather(*readers)
-            await asyncio.wait_for(monitor.queue.join(), timeout=60)
-        except asyncio.TimeoutError:
-            pass
         finally:
-            worker.cancel()
-            for t in readers:
-                t.cancel()
-            await asyncio.gather(worker, *readers, return_exceptions=True)
-            log.info(
-                "Session summary: %d alert(s), %d suppressed",
-                monitor.finding_count,
-                monitor.suppression_count,
-            )
+            for reader in readers:
+                reader.cancel()
+            await asyncio.gather(*readers, return_exceptions=True)
+            await monitor.finish()
+        if monitor.degraded:
+            raise typer.Exit(1)
 
     try:
         asyncio.run(run_live())
@@ -340,10 +340,11 @@ def watch(
 
 @app.command()
 def analyze(
+    local: bool = typer.Option(False, "--local", help="Analyze with local rules and disable remote delivery"),
     file: Path = typer.Option(..., "--file", help="Log file to analyze"),
     since: str = typer.Option(None, "--since", help="Only lines at/after this time (ISO 8601)"),
     until: str = typer.Option(None, "--until", help="Only lines at/before this time (ISO 8601)"),
-    max_alerts: int = typer.Option(10, "--max-alerts", help="Maximum number of anomalies to analyze with the LLM"),
+    max_alerts: int = typer.Option(10, "--max-alerts", min=0, help="Maximum number of anomalies to analyze with the LLM"),
     model: str = typer.Option(None, "--model", help="Gemini model name"),
     api_key: str = typer.Option(None, "--api-key", help="Gemini API key (or set GEMINI_API_KEY env)"),
 ) -> None:
@@ -367,11 +368,13 @@ def analyze(
 
     since_ts = parse_bound(since, "since")
     until_ts = parse_bound(until, "until")
+    if since_ts is not None and until_ts is not None and since_ts > until_ts:
+        raise typer.BadParameter("--since must be at or before --until")
 
     if not file.is_file():
         typer.echo(f"File not found: {file}", err=True)
         raise typer.Exit(1)
-    key = _resolve_api_key(api_key)
+    key = _resolve_api_key(api_key, local)
 
     async def main() -> None:
         monitor = Monitor(
@@ -385,7 +388,7 @@ def analyze(
         now = [0.0]
         monitor.buffer.clock = lambda: now[0]
         monitor.engine.cooldowns = CooldownTracker(clock=lambda: now[0])
-        monitor.engine.agent_queue = asyncio.Queue()  # unbounded: nothing consumes it until the end
+        events = []
 
         total = 0
         with open(file, encoding="utf-8", errors="replace") as f:
@@ -400,20 +403,22 @@ def analyze(
                 now[0] = ts
                 monitor.ingest(log_obj, live=False)
                 total += 1
+                if not monitor.queue.empty():
+                    event = monitor.queue.get_nowait()
+                    if len(events) < max_alerts:
+                        events.append(event)
+                    monitor.queue.task_done()
 
-        events = []
-        while not monitor.engine.agent_queue.empty():
-            events.append(monitor.engine.agent_queue.get_nowait())
-
-        typer.echo(f"Scanned {total} lines — {len(events)} anomaly trigger(s), {monitor.suppression_count} suppressed.")
+        typer.echo(f"Scanned {total} lines — {monitor.engine.accepted} anomaly trigger(s), {monitor.suppression_count} suppressed.")
         if not events:
             return
-        if len(events) > max_alerts:
+        if monitor.engine.accepted > max_alerts:
             typer.echo(f"Analyzing the first {max_alerts} (raise --max-alerts to see more).")
-            events = events[:max_alerts]
 
         for event in events:
             await monitor.handle_finding(await monitor.agent.analyze(event))
+        if monitor.delivery_failures:
+            raise typer.Exit(1)
 
     try:
         asyncio.run(main())
@@ -631,6 +636,7 @@ def telegram(
 
 @app.command()
 def chat(
+    preview: bool = typer.Option(False, "--preview", help="Print sanitized context locally and exit"),
     error: str | None = typer.Option(
         None, "--error", "-e", help="Single-shot: analyze this error or log excerpt"
     ),
@@ -662,7 +668,7 @@ def chat(
         raise typer.Exit(1)
 
     api_key = get_api_key()
-    if not api_key:
+    if not api_key and not preview:
         console.print("[red]No API key found.[/red] Set GEMINI_API_KEY or run [green]logwhisper setup[/green] first.")
         raise typer.Exit(1)
 
@@ -675,12 +681,20 @@ def chat(
             console.print(f"[red]File not found: {escape(str(file))}[/red]")
             raise typer.Exit(1)
         try:
-            lines = file.read_text(encoding="utf-8", errors="replace").splitlines()
+            with file.open("rb") as stream:
+                stream.seek(max(0, os.fstat(stream.fileno()).st_size - 65536))
+                lines = stream.read(65536).decode("utf-8", errors="replace").splitlines()
         except OSError as exc:
             console.print(f"[red]Failed to read file: {escape(str(exc))}[/red]")
             raise typer.Exit(1)
         log_lines = [ln.strip() for ln in lines if ln.strip()][-100:]
         console.print(f"[dim]Loaded {len(log_lines)} lines from {escape(file.name)}[/dim]")
+
+    if preview:
+        from agent.chat import _format_chat_context
+        from agent.privacy import redact
+        typer.echo(redact(_format_chat_context(project_ctx, log_lines, error), api_key or ""))
+        return
 
     agent = ChatAgent(api_key=api_key, model=model)
 

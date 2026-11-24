@@ -6,7 +6,6 @@ import asyncio
 import logging
 import re
 from pathlib import Path
-from typing import Any
 
 from rich.columns import Columns
 from rich.console import Console
@@ -17,8 +16,9 @@ from rich.text import Text
 from agent.deps import check_service_deps
 from agent.detect import detect_project_parts, detect_project_type
 from agent.pipeline import Monitor
-from agent.procs import ainput, iter_lines, spawn, terminate
-from agent.session import ensure_api_key, get_api_key
+from agent.readiness import report_endpoint
+from agent.procs import child_environment, ainput, iter_lines, spawn, terminate
+from agent.session import get_api_key
 from buffer.parser import parse
 from output.dashboard import Dashboard
 
@@ -28,14 +28,7 @@ logger = logging.getLogger("logwhisper")
 # ANSI escape code strip pattern (matches SGR and other common sequences)
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]")
 
-# Pattern to extract localhost / 0.0.0.0 URLs printed by dev servers
-_URL_RE = re.compile(
-    r"(https?://(?:localhost|127\.0\.0\.1|0\.0\.0\.0)(?::\d{1,5})?(?:/\S*)?)",
-    re.IGNORECASE,
-)
-
-
-async def run(auto_install: bool = False, skip_deps_check: bool = False) -> None:
+async def run(auto_install: bool = False, skip_deps_check: bool = False, local: bool = False) -> None:
     """Main run flow: detect all project parts → check deps → spawn all services → monitor logs."""
 
     # --- Project Detection ---
@@ -63,7 +56,7 @@ async def run(auto_install: bool = False, skip_deps_check: bool = False) -> None
         Path(info["log_path"]).parent.mkdir(parents=True, exist_ok=True)
 
     # --- API Key ---
-    api_key = ensure_api_key(get_api_key())
+    api_key = "" if local else get_api_key() or ""
 
     # --- Print startup header ---
     _print_header(parts)
@@ -83,7 +76,6 @@ async def run(auto_install: bool = False, skip_deps_check: bool = False) -> None
     )
 
     processes: dict[str, asyncio.subprocess.Process] = {}
-    log_files: dict[str, Any] = {}
     tasks: list[asyncio.Task] = []
 
     try:
@@ -91,7 +83,6 @@ async def run(auto_install: bool = False, skip_deps_check: bool = False) -> None
 
         # --- Spawn all service subprocesses ---
         for name, info in parts.items():
-            log_files[name] = open(info["log_path"], "a", encoding="utf-8", errors="replace")
             try:
                 proc = await spawn(info["command"])
                 processes[name] = proc
@@ -99,20 +90,19 @@ async def run(auto_install: bool = False, skip_deps_check: bool = False) -> None
                 console.print(f"[green]Started {escape(name)}[/green] (PID {proc.pid})")
             except Exception as exc:
                 console.print(f"[red]Failed to start {escape(name)}: {escape(str(exc))}[/red]")
+                monitor.source_failures += 1
                 dashboard.set_error(name)
 
         if not processes:
             console.print("[red]No service could be started.[/red]")
-            return
+            raise SystemExit(1)
 
         console.print()
 
-        # Track which services have already announced their URL (avoid spam)
-        announced_urls: set[str] = set()
-
         async def read_service_output(name: str, proc: asyncio.subprocess.Process) -> None:
             """Read subprocess output, display, tee to log file, feed to trigger engine."""
-            log_file = log_files.get(name)
+            log_path = Path(parts[name]["log_path"])
+            announced = set()
             async for decoded in iter_lines(proc.stdout):
                 # Strip ANSI escape codes (e.g. from Vite/Node color output)
                 clean = _ANSI_RE.sub("", decoded)
@@ -122,37 +112,23 @@ async def run(auto_install: bool = False, skip_deps_check: bool = False) -> None
                 dashboard.append_log(name, clean)
                 dashboard.increment_lines(name)
 
-                if log_file:
-                    log_file.write(clean + "\n")
-                    log_file.flush()
+                monitor.capture(log_path, clean)
 
-                # --- Detect real URL from server output and announce it ---
-                url_match = _URL_RE.search(clean)
-                if url_match:
-                    real_url = url_match.group(1).rstrip("/").replace("0.0.0.0", "localhost")
-                    key = f"{name}:{real_url}"
-                    if key not in announced_urls:
-                        announced_urls.add(key)
-                        console.print()
-                        console.print(
-                            Panel(
-                                f"[bold green]🌐  {escape(name)}[/bold green]  is ready\n\n"
-                                f"   [bold white underline]{escape(real_url)}[/bold white underline]",
-                                border_style="green",
-                                padding=(0, 2),
-                                expand=False,
-                            )
-                        )
-                        console.print()
+                await report_endpoint(console, name, clean, announced)
 
                 # Feed to trigger engine (evaluates BEFORE pushing to the buffer)
                 monitor.ingest(parse(clean, source=name, adapter="subprocess"))
 
-            dashboard.set_stopped(name)
+            code = await proc.wait()
+            console.print(f"[dim]{escape(name)} exited (code {code}).[/dim]")
+            if code:
+                monitor.source_failures += 1
+                dashboard.set_error(name)
+            else:
+                dashboard.set_stopped(name)
 
         # --- Start all async tasks ---
-        worker_task = monitor.start_worker()
-        tasks.append(worker_task)
+        monitor.start_worker()
         output_tasks = [
             asyncio.create_task(read_service_output(name, proc))
             for name, proc in processes.items()
@@ -163,12 +139,6 @@ async def run(auto_install: bool = False, skip_deps_check: bool = False) -> None
         # must not be part of the wait.
         await asyncio.gather(*output_tasks)
 
-        # Give queued alerts a moment to be analyzed and shown before shutting down
-        try:
-            await asyncio.wait_for(monitor.queue.join(), timeout=60)
-        except asyncio.TimeoutError:
-            pass
-
     except (asyncio.CancelledError, KeyboardInterrupt):
         console.print("\n[dim]Interrupted...[/dim]")
     finally:
@@ -176,13 +146,11 @@ async def run(auto_install: bool = False, skip_deps_check: bool = False) -> None
             t.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         await asyncio.gather(*(terminate(p) for p in processes.values()), return_exceptions=True)
-        for lf in log_files.values():
-            try:
-                lf.close()
-            except Exception:
-                pass
+        await monitor.finish()
         dashboard.stop()
         console.print("[dim]Goodbye![/dim]")
+    if monitor.degraded:
+        raise SystemExit(1)
 
 
 def _check_and_install_deps(parts: dict[str, dict], auto_install: bool, console: Console) -> None:
@@ -237,6 +205,7 @@ def run_install(services_needing_deps: list[tuple[str, Path]], console: Console)
             proc = subprocess.run(
                 result.install_command(),
                 cwd=str(path),
+                env=child_environment(),
                 capture_output=True,
                 text=True,
                 timeout=300,
@@ -295,13 +264,6 @@ def _print_header(parts: dict[str, dict]) -> None:
     for name, info in parts.items():
         console.print(f"  [cyan]{escape(name)}[/cyan]  {escape(info['command'])}")
         console.print(f"           logs: {escape(info['log_path'])}")
-        url = info.get("url")
-        if url:
-            console.print(
-                f"           [dim]expected url →[/dim] "
-                f"[bold cyan underline]{escape(url)}[/bold cyan underline]"
-                f"  [dim](will confirm when server starts)[/dim]"
-            )
     console.print()
 
 

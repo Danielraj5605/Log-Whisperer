@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import logging
+import math
 import os
 import re
 from pathlib import Path
@@ -22,15 +23,17 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "max_tokens": 2048,
         "timeout_seconds": 30,
     },
+    "privacy": {"project_context": False, "chat_service_logs": False},
+    "storage": {"max_bytes": 10_485_760, "backups": 3, "capture_logs": True},
     "buffer": {"max_lines": 500, "context_window_seconds": 60},
     "triggers": {
         "rate_spike": {"enabled": True, "threshold": 5, "window_seconds": 10, "cooldown_seconds": 30},
         "new_error_type": {"enabled": True, "cooldown_seconds": 5},
         "critical_keyword": {"enabled": True, "cooldown_seconds": 30, "extra_keywords": []},
         "http_error": {"enabled": True, "cooldown_seconds": 30},
-        "metric_threshold": {"enabled": True, "cooldown_seconds": 60},
-        "cluster_formation": {"enabled": True, "cooldown_seconds": 120},
-        "silence_anomaly": {"enabled": True, "cooldown_seconds": 300},
+        "metric_threshold": {"thresholds": {}, "enabled": True, "cooldown_seconds": 60},
+        "cluster_formation": {"min_sources": 3, "window_seconds": 30, "enabled": True, "cooldown_seconds": 120},
+        "silence_anomaly": {"silence_threshold_seconds": 60, "enabled": True, "cooldown_seconds": 300},
     },
     "output": {
         "terminal": True,
@@ -55,15 +58,37 @@ def expand_env(value: Any) -> Any:
     return value
 
 
-def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
-    for key, value in override.items():
-        if isinstance(value, dict) and isinstance(base.get(key), dict):
-            _deep_merge(base[key], value)
-        elif value is None and isinstance(base.get(key), dict):
-            continue  # `section:` with no body — keep defaults
+def _deep_merge(base: dict, override: dict, prefix: str = "") -> None:
+    for key, default in base.items():
+        if key not in override:
+            continue
+        value = override[key]
+        field = prefix + key
+        if key == "thresholds":
+            valid = isinstance(value, dict) and all(
+                isinstance(k, str) and (type(v) is int or (type(v) is float and math.isfinite(v))) for k, v in value.items()
+            )
+        elif isinstance(default, dict):
+            if isinstance(value, dict):
+                _deep_merge(default, value, field + ".")
+                continue
+            valid = False
+        elif isinstance(default, list):
+            valid = isinstance(value, list) and all(isinstance(v, str) for v in value)
+        elif isinstance(value, str) and key == "provider":
+            valid = value == "gemini"
+        elif type(default) is int:
+            valid = type(value) is int and value >= (0 if key == "cooldown_seconds" else 1)
+            if key == "timeout_seconds":
+                valid = type(value) in (int, float) and 0 < value <= 3600
         else:
-            base[key] = value
-    return base
+            valid = type(default) is type(value)
+            if valid and isinstance(value, str) and key != "api_key":
+                valid = bool(expand_env(value).strip())
+        if valid:
+            base[key] = expand_env(value)
+        else:
+            logger.warning("Invalid configuration field %s; using its default", field)
 
 
 def load(path: Path | str | None = None) -> dict[str, Any]:
@@ -80,13 +105,16 @@ def load(path: Path | str | None = None) -> dict[str, Any]:
     if path.is_file():
         try:
             with open(path, encoding="utf-8") as f:
-                raw = yaml.safe_load(f) or {}
-        except (yaml.YAMLError, OSError, UnicodeDecodeError) as exc:
-            logger.warning("Could not read %s (%s) — using default config", path, exc)
+                document = f.read(65537)
+                if len(document) > 65536:
+                    raise ValueError("configuration exceeds size limit")
+                raw = yaml.safe_load(document) or {}
+        except (yaml.YAMLError, OSError, ValueError, RecursionError) as exc:
+            logger.warning("Could not read %s (%s) — using default config", path, type(exc).__name__)
             raw = {}
 
         if isinstance(raw, dict):
-            _deep_merge(config, expand_env(raw))
+            _deep_merge(config, raw)
         else:
             logger.warning("%s must contain a mapping at the top level — ignoring it", path)
 

@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from rich.console import Console
 from rich.markup import escape
@@ -20,9 +20,10 @@ console = Console()
 class Shell:
     """Interactive shell: runs any command, tee-ing output to log file, while monitoring logs."""
 
-    def __init__(self, log_path: str | Path | None = None) -> None:
+    def __init__(self, log_path: str | Path | None = None, on_line: Callable[[str], None] | None = None) -> None:
         self.log_path = Path(log_path) if log_path else None
         self.process: asyncio.subprocess.Process | None = None
+        self.on_line = on_line
         self.running = False
         self._log_file: Any = None
 
@@ -33,7 +34,7 @@ class Shell:
 
         # Ensure log directory exists
         self._log_file = None
-        if self.log_path:
+        if self.log_path and self.on_line is None:
             try:
                 self.log_path.parent.mkdir(parents=True, exist_ok=True)
                 self._log_file = open(self.log_path, "a", encoding="utf-8", errors="replace")
@@ -47,6 +48,8 @@ class Shell:
             # Read output line by line, display + tee
             async for line in iter_lines(self.process.stdout):
                 console.print(Text(line), soft_wrap=True, highlight=False)
+                if self.on_line:
+                    self.on_line(line)
                 if self._log_file:
                     self._log_file.write(line + "\n")
                     self._log_file.flush()

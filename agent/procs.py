@@ -15,13 +15,19 @@ T = TypeVar("T")
 _STREAM_LIMIT = 1024 * 1024  # max bytes per output line before the reader gives up on it
 
 
+def child_environment() -> dict[str, str]:
+    env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+    for name in ("GEMINI_API_KEY", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"):
+        env.pop(name, None)
+    return env
+
+
 async def spawn(command: str) -> asyncio.subprocess.Process:
     """Start a shell command with stdout+stderr merged into one pipe.
 
     The child gets its own process group (POSIX) so the whole tree can be stopped later,
     and PYTHONUNBUFFERED so Python services show their logs live instead of in 4KB bursts.
     """
-    env = {**os.environ, "PYTHONUNBUFFERED": "1"}
     kwargs: dict = {}
     if sys.platform != "win32":
         kwargs["start_new_session"] = True
@@ -29,7 +35,7 @@ async def spawn(command: str) -> asyncio.subprocess.Process:
         command,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
-        env=env,
+        env=child_environment(),
         limit=_STREAM_LIMIT,
         **kwargs,
     )

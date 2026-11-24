@@ -1,56 +1,32 @@
-"""Windows toast notifications via winotify."""
+"""Windows toast notifications using the Windows Runtime."""
 
 from __future__ import annotations
 
-import logging
 import sys
-import threading
 from typing import Any
-
-try:
-    import winotify
-    WINOTIFY_AVAILABLE = sys.platform == "win32"
-except ImportError:
-    WINOTIFY_AVAILABLE = False
+from xml.etree import ElementTree as ET
 
 from output import _fmt
 
-logger = logging.getLogger(__name__)
-
-
 class WindowsNotifier:
-    """Send Windows toast notifications when an alert fires."""
-
-    def __init__(self) -> None:
-        self._available = WINOTIFY_AVAILABLE
-        if not self._available and sys.platform == "win32":
-            logger.warning("winotify not installed — Windows notifications disabled")
+    """Build a toast using XML text nodes and the native Windows Runtime."""
 
     def notify(self, finding: dict[str, Any]) -> None:
-        """
-        Show a Windows toast notification for an alert finding.
-
-        winotify shells out to PowerShell, which takes a noticeable fraction of a second,
-        so the toast is shown from a background thread to keep the event loop responsive.
-
-        Args:
-            finding: Structured alert dict from the agent.
-        """
-        if not self._available:
+        if sys.platform != "win32":
             return
+        from winrt.windows.data.xml.dom import XmlDocument
+        from winrt.windows.ui.notifications import ToastNotification, ToastNotificationManager
 
-        title = self._title(finding)
-        body = self._body(finding)
-        threading.Thread(
-            target=self._show, args=(title, body), name="logwhisper-toast", daemon=True
-        ).start()
+        document = XmlDocument()
+        document.load_xml(self._xml(finding))
+        ToastNotificationManager.create_toast_notifier("Log Whisperer").show(ToastNotification(document))
 
-    @staticmethod
-    def _show(title: str, body: str) -> None:
-        try:
-            winotify.Notification(app_id="Log Whisperer", title=title, msg=body).show()
-        except Exception as exc:
-            logger.error("Failed to show Windows notification: %s", exc)
+    def _xml(self, finding: dict[str, Any]) -> str:
+        root = ET.Element("toast")
+        binding = ET.SubElement(ET.SubElement(root, "visual"), "binding", template="ToastGeneric")
+        for value in (self._title(finding), self._body(finding)):
+            ET.SubElement(binding, "text").text = value
+        return ET.tostring(root, encoding="unicode")
 
     def _title(self, finding: dict[str, Any]) -> str:
         confidence = _fmt.confidence(finding)

@@ -9,9 +9,8 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-import yaml
+from config import load
 
-from config import expand_env
 
 
 def get_global_config_dir() -> Path:
@@ -126,19 +125,8 @@ def get_provider() -> str:
 
 def get_project_api_key() -> str | None:
     """Get API key from project .logwhisper.yaml (supports ${ENV_VAR} references)."""
-    config_path = Path.cwd() / ".logwhisper.yaml"
-    try:
-        with open(config_path, encoding="utf-8") as f:
-            config = yaml.safe_load(f)
-    except (yaml.YAMLError, OSError, UnicodeDecodeError):
-        return None
-    if not isinstance(config, dict):
-        return None
-    llm = config.get("llm")
-    if not isinstance(llm, dict):
-        return None
-    key = expand_env(llm.get("api_key"))
-    return key.strip() if isinstance(key, str) and key.strip() else None
+    key = load()["llm"]["api_key"]
+    return key.strip() or None
 
 
 def mask_secret(secret: str, visible: int = 4) -> str:
@@ -186,8 +174,8 @@ def get_telegram_config() -> dict[str, str]:
     """Get Telegram bot token and chat ID from global config."""
     data = _read_credentials()
     return {
-        "bot_token": str(data.get("telegram_bot_token") or ""),
-        "chat_id": str(data.get("telegram_chat_id") or ""),
+        "bot_token": os.getenv("TELEGRAM_BOT_TOKEN") or str(data.get("telegram_bot_token") or ""),
+        "chat_id": os.getenv("TELEGRAM_CHAT_ID") or str(data.get("telegram_chat_id") or ""),
     }
 
 

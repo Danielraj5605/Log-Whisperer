@@ -196,7 +196,10 @@ def detect_dev_command(project_type: ProjectType, path: Path | None = None) -> s
     elif project_type == "static":
         # Use Python's built-in HTTP server — zero extra installs needed.
         # Serves index.html at http://localhost:3000
-        return f'{_python_cmd()} -m http.server 3000 --directory "{path}"'
+        server = Path(__file__).with_name("static_server.py")
+        public = path / "public"
+        root = public if (public / "index.html").is_file() else path
+        return f'{_python_cmd()} "{server}" "{root}"'
 
     return None
 

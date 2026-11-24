@@ -20,6 +20,7 @@ from agent.chat import ChatAgent, get_project_context
 from agent.deps import check_service_deps
 from agent.detect import detect_project_parts
 from agent.pipeline import Monitor
+from agent.readiness import report_endpoint
 from agent.procs import ainput, iter_lines, spawn, terminate
 from agent.run import run_install
 from agent.session import (
@@ -41,14 +42,6 @@ logger = logging.getLogger("logwhisper")
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]")
 
 # Detect localhost URLs printed by dev servers (handles IPv4, IPv6, 0.0.0.0)
-_URL_RE = re.compile(
-    r"(https?://(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::(?:1)?\])(?::\d{1,5})?(?:/\S*)?)",
-    re.IGNORECASE,
-)
-
-
-# ─── Help text ────────────────────────────────────────────────────────────────
-
 HELP_TEXT = """\
 [bold]Available Commands:[/bold]
 
@@ -56,6 +49,7 @@ HELP_TEXT = """\
   [cyan]/run[/cyan]                      Start all detected services with monitoring
   [cyan]/run-frontend[/cyan]             Start only the frontend service
   [cyan]/run-backend[/cyan]              Start only the backend service
+  [cyan]/status[/cyan]                   Show source, queue and delivery health
   [cyan]/stop[/cyan]                     Stop all running services
   [cyan]/watch \\[file][/cyan]             Watch a log file (e.g. /watch ./logs/app.log)
   [cyan]/chat \\[message][/cyan]           Ask the AI about errors (e.g. /chat why did the 401 happen?)
@@ -99,7 +93,6 @@ class REPLSession:
 
         # Service processes
         self._processes: dict[str, asyncio.subprocess.Process] = {}
-        self._log_file_handles: dict[str, Any] = {}
 
         # Background tasks
         self._all_tasks: list[asyncio.Task[Any]] = []
@@ -145,8 +138,10 @@ class REPLSession:
 
         if name == "/help":
             self._cmd_help()
+        elif name == "/status":
+            console.print(self._monitor.status() if self._monitor else "No monitoring session.")
         elif name == "/run":
-            await self._cmd_run()
+            await self._cmd_run(local=args == "--local")
         elif name == "/run-frontend":
             await self._cmd_run_only("frontend", ("frontend",))
         elif name == "/run-backend":
@@ -174,8 +169,10 @@ class REPLSession:
     def _cmd_help(self) -> None:
         console.print(Panel(HELP_TEXT, title="Help", border_style="cyan", padding=(1, 2)))
 
-    async def _cmd_run(self) -> None:
+    async def _cmd_run(self, *, local: bool = False) -> None:
         """Start all detected services with full monitoring."""
+        if self._services_running and all(p.returncode is not None for p in self._processes.values()):
+            await self._cmd_stop(quiet=True)
         if self._services_running:
             console.print("[yellow]Services are already running.[/yellow]")
             self._print_service_status()
@@ -192,28 +189,16 @@ class REPLSession:
             console.print(f"  [cyan]{escape(name)}[/cyan] — {escape(info['command'])}")
         console.print()
 
-        if not await self._start_services(list(self._parts.keys())):
+        if not await self._start_services(list(self._parts.keys()), local=local):
             return
         console.print("[green]Services started.[/green]")
         console.print("[dim]Use /stop to stop them, or /chat to ask about errors.[/dim]")
 
-        # Print URLs for every service that has one — always shown, regardless of server output
-        for name, info in self._parts.items():
-            if name in self._processes and info.get("url"):
-                console.print(
-                    Panel(
-                        f"[bold green]\U0001f310  {escape(name)}[/bold green]\n\n"
-                        f"   [bold white underline]{escape(info['url'])}[/bold white underline]"
-                        f"  [dim]← open in browser[/dim]",
-                        border_style="green",
-                        padding=(0, 2),
-                        expand=False,
-                    )
-                )
-        console.print()
 
     async def _cmd_run_only(self, label: str, name_hints: tuple[str, ...]) -> None:
         """Start only the services whose name contains one of the hints."""
+        if self._services_running and all(p.returncode is not None for p in self._processes.values()):
+            await self._cmd_stop(quiet=True)
         if self._services_running:
             console.print("[yellow]Services are already running.[/yellow]")
             return
@@ -248,14 +233,8 @@ class REPLSession:
         procs, self._processes = list(self._processes.values()), {}
         await asyncio.gather(*(terminate(p) for p in procs), return_exceptions=True)
 
-        # Close log files
-        for lf in self._log_file_handles.values():
-            try:
-                lf.close()
-            except Exception:
-                pass
-        self._log_file_handles.clear()
-
+        if self._monitor:
+            await self._monitor.finish()
         self._services_running = False
         if not quiet:
             console.print("[dim]All services stopped.[/dim]\n")
@@ -278,8 +257,7 @@ class REPLSession:
             context_lines.append("[RUNNING SERVICES]")
             for name, proc in self._processes.items():
                 status = "running" if proc.returncode is None else f"stopped (exit {proc.returncode})"
-                cmd = self._parts.get(name, {}).get("command", "unknown")
-                context_lines.append(f"  {name}: {status}  (cmd: {cmd})")
+                context_lines.append(f"  {name}: {status}")
             context_lines.append("")
         else:
             context_lines.append("[NO SERVICES RUNNING — user has not run /run yet]")
@@ -287,7 +265,8 @@ class REPLSession:
 
         # ── Recent buffered log lines ─────────────────────────────────────
         log_lines: list[str] = []
-        if self._monitor:
+        from config import load
+        if self._monitor and load()["privacy"]["chat_service_logs"]:
             for entry in self._monitor.buffer.recent(100):
                 raw = entry.get("raw", "")
                 if raw:
@@ -325,7 +304,8 @@ class REPLSession:
             return
 
         # File path given — tail that file
-        file_path = args
+        local = args.startswith("--local ")
+        file_path = args.removeprefix("--local ").strip()
         if file_path.startswith("--file"):
             file_path = file_path[len("--file"):].strip()
 
@@ -341,16 +321,25 @@ class REPLSession:
         console.print(f"[dim]Watching:[/dim] {escape(file_path)}")
         console.print("[dim]Press Ctrl+C to stop watching.[/dim]\n")
 
-        adapter = FileAdapter(path=p, poll_ms=100)
+        monitor = Monitor("" if local else self._api_key or "")
+        monitor.start_worker()
+        adapter = FileAdapter(path=p, poll_ms=100, source=str(p.resolve()))
         try:
             async for log_obj in adapter.stream():
+                monitor.ingest(log_obj)
                 clean = _ANSI_RE.sub("", log_obj.get("raw", ""))
                 if clean:
                     console.print(Text(clean), soft_wrap=True, highlight=False)
         except asyncio.CancelledError:
             self._swallow_cancel()
+        except OSError as exc:
+            monitor.source_failures += 1
+            console.print(f"[red]Watch failed:[/red] {escape(str(exc))}")
         finally:
             adapter.stop()
+            await monitor.finish()
+            if not self._services_running:
+                self._monitor = monitor
         console.print("[dim]Stopped watching.[/dim]\n")
 
     async def _stream_buffer(self, monitor: Monitor) -> None:
@@ -494,7 +483,7 @@ class REPLSession:
 
     # ── Service Management ────────────────────────────────────────────────────
 
-    async def _start_services(self, service_names: list[str]) -> bool:
+    async def _start_services(self, service_names: list[str], *, local: bool = False) -> bool:
         """Start services by name and begin monitoring. Returns True if any service started."""
         parts = {k: v for k, v in self._parts.items() if k in service_names}
         if not parts:
@@ -502,60 +491,36 @@ class REPLSession:
 
         if not self._api_key:
             console.print(
-                "[yellow]No API key configured — services will run, but alerts can't be "
-                "analyzed. Run /setup to add one.[/yellow]"
+                "[yellow]Using local rule analysis.[/yellow]"
             )
 
         # Check and install dependencies BEFORE spawning services
         await self._check_and_install_deps(parts)
 
-        monitor = Monitor(self._api_key or "")
+        monitor = Monitor("" if local else self._api_key or "")
         self._monitor = monitor
 
         started: dict[str, asyncio.subprocess.Process] = {}
         for name, info in parts.items():
-            log_path = Path(info["log_path"])
-            try:
-                log_path.parent.mkdir(parents=True, exist_ok=True)
-                lf = open(log_path, "a", encoding="utf-8", errors="replace")
-            except OSError as exc:
-                console.print(f"[red]Cannot open log file for {escape(name)}:[/red] {escape(str(exc))}")
-                continue
-
             try:
                 proc = await spawn(info["command"])
             except Exception as exc:
-                lf.close()
                 console.print(f"[red]Failed to start {escape(name)}:[/red] {escape(str(exc))}")
                 continue
 
-            self._log_file_handles[name] = lf
             self._processes[name] = proc
             started[name] = proc
             console.print(f"[green]Started {escape(name)}[/green] (PID {proc.pid})")
-
-            url = info.get("url")
-            if url:
-                console.print(
-                    Panel(
-                        f"[bold green]\U0001f310  {escape(name)}[/bold green]\n\n"
-                        f"   Open [bold white underline]{escape(url)}[/bold white underline]"
-                        f"  [dim](server is starting...)[/dim]",
-                        border_style="green",
-                        padding=(0, 2),
-                        expand=False,
-                    )
-                )
 
         console.print()
         if not started:
             return False
 
         self._services_running = True
-        self._all_tasks.append(monitor.start_worker())
+        monitor.start_worker()
         for name, proc in started.items():
             self._all_tasks.append(
-                asyncio.create_task(self._read_service_output(name, proc, self._log_file_handles[name]))
+                asyncio.create_task(self._read_service_output(name, proc, Path(parts[name]["log_path"])))
             )
         return True
 
@@ -563,7 +528,7 @@ class REPLSession:
         self,
         name: str,
         proc: asyncio.subprocess.Process,
-        log_file: Any,
+        log_file: Path,
     ) -> None:
         """Read subprocess stdout, print, tee to file, feed to trigger engine."""
         announced: set[str] = set()   # avoid printing same URL twice per service
@@ -574,38 +539,19 @@ class REPLSession:
 
             print_service_log(name, clean)
 
-            if log_file and not log_file.closed:
-                log_file.write(clean + "\n")
-                log_file.flush()
+            if self._monitor:
+                self._monitor.capture(log_file, clean)
 
-            # --- Live URL detection: catch the real URL/port the server chose ---
-            url_match = _URL_RE.search(clean)
-            if url_match:
-                real_url = (
-                    url_match.group(1).rstrip("/")
-                    .replace("0.0.0.0", "localhost")
-                    .replace("[::]", "localhost")
-                    .replace("[::1]", "localhost")
-                )
-                if real_url not in announced:
-                    announced.add(real_url)
-                    console.print()
-                    console.print(
-                        Panel(
-                            f"[bold green]\U0001f310  {escape(name)}[/bold green]  is ready\n\n"
-                            f"   [bold white underline]{escape(real_url)}[/bold white underline]",
-                            border_style="bright_green",
-                            padding=(0, 2),
-                            expand=False,
-                        )
-                    )
-                    console.print()
+            await report_endpoint(console, name, clean, announced)
 
             # Feed to trigger engine (evaluates BEFORE pushing to the buffer)
             if self._monitor:
                 self._monitor.ingest(parse(clean, source=name, adapter="subprocess"))
 
-        console.print(f"[dim]{escape(name)} exited (code {proc.returncode}).[/dim]")
+        code = await proc.wait()
+        if code and self._monitor:
+            self._monitor.source_failures += 1
+        console.print(f"[dim]{escape(name)} exited (code {code}).[/dim]")
 
     # ── Dependency Check ────────────────────────────────────────────────────
 

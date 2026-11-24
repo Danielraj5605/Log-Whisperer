@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 from typing import Any
 
+from agent.privacy import redact
 from agent.gemini_client import (
     GEMINI_BASE_URL,
     GEMINI_DEFAULT_MODEL,
@@ -90,9 +91,14 @@ def get_project_context() -> dict[str, Any]:
         "package_info": {},
     }
 
+    from config import load
+    if not load()["privacy"]["project_context"]:
+        return context
+
     def read(name: str, limit: int) -> str | None:
         try:
-            return (cwd / name).read_text(encoding="utf-8", errors="replace")[:limit]
+            with (cwd / name).open(encoding="utf-8", errors="replace") as stream:
+                return stream.read(limit)
         except OSError:
             return None
 
@@ -140,7 +146,7 @@ def _format_chat_context(context: dict[str, Any], log_lines: list[str], error: s
     if log_lines:
         parts.append("[RECENT LOG LINES]")
         for line in log_lines[-50:]:
-            parts.append(line[:500])
+            parts.append(redact(line)[:500])
         parts.append("")
 
     # User's error
@@ -176,7 +182,7 @@ class ChatAgent:
                 system_text = msg["content"]
             else:
                 role = "model" if msg["role"] == "assistant" else "user"
-                chat_messages.append({"role": role, "parts": [{"text": msg["content"]}]})
+                chat_messages.append({"role": role, "parts": [{"text": redact(msg["content"], self.api_key)}]})
 
         payload: dict[str, Any] = {
             "contents": chat_messages,
@@ -240,4 +246,5 @@ class ChatAgent:
         if remember:
             # Store only the question (not the bulky context) to keep history small
             self.history.append((question, answer))
+            del self.history[:-_MAX_HISTORY_TURNS]
         return answer

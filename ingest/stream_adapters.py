@@ -7,6 +7,7 @@ import sys
 import threading
 from typing import AsyncIterator
 
+from agent.procs import child_environment
 from buffer.parser import parse
 
 
@@ -24,6 +25,7 @@ class DockerAdapter:
                 "docker", "logs", "-f", "--tail", str(self._tail), self._container,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
+                env=child_environment(),
                 limit=1024 * 1024,
             )
         except FileNotFoundError:
@@ -40,7 +42,7 @@ class DockerAdapter:
                     break
                 line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
                 if line.strip():
-                    yield parse(line, source=self._container, adapter="docker")
+                    yield parse(line, source=f"docker:{self._container}", adapter="docker")
         finally:
             await self.stop()
 
@@ -69,24 +71,35 @@ class StdinAdapter:
 
     async def stream(self) -> AsyncIterator[dict]:
         loop = asyncio.get_running_loop()
-        queue: asyncio.Queue[str | None] = asyncio.Queue()
+        capacity = threading.Semaphore(128)
+        stopped = threading.Event()
+        queue: asyncio.Queue[str | None] = asyncio.Queue(maxsize=129)
 
         def reader() -> None:
             # Daemon thread: a blocked read must not keep the interpreter alive at exit
             try:
                 for line in sys.stdin:
+                    capacity.acquire()
+                    if stopped.is_set():
+                        return
                     loop.call_soon_threadsafe(queue.put_nowait, line)
             except (ValueError, OSError):
                 pass
             finally:
-                loop.call_soon_threadsafe(queue.put_nowait, None)
+                if not stopped.is_set():
+                    loop.call_soon_threadsafe(queue.put_nowait, None)
 
         threading.Thread(target=reader, name="logwhisper-stdin", daemon=True).start()
 
-        while True:
-            line = await queue.get()
-            if line is None:
-                break
-            line = line.rstrip("\r\n")
-            if line.strip():
-                yield parse(line, source=self._source, adapter="stdin")
+        try:
+            while True:
+                line = await queue.get()
+                if line is None:
+                    break
+                capacity.release()
+                line = line.rstrip("\r\n")
+                if line.strip():
+                    yield parse(line, source=self._source, adapter="stdin")
+        finally:
+            stopped.set()
+            capacity.release()

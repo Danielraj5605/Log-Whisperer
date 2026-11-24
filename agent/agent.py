@@ -9,6 +9,7 @@ import time
 import uuid
 from typing import Any
 
+from agent.privacy import redact
 from agent.gemini_client import (
     GEMINI_BASE_URL,
     GEMINI_DEFAULT_MODEL,
@@ -53,18 +54,18 @@ _LIST_FIELDS = ("contributing_factors", "evidence")
 _STR_FIELDS = ("root_signal", "caused_by", "blast_radius", "action")
 
 
-def _format_context(trigger_event: dict[str, Any]) -> str:
+def _format_context(trigger_event: dict[str, Any], api_key: str = "") -> str:
     rule = trigger_event["rule"]
     source = trigger_event["log_obj"]["source"]
     ts = trigger_event["log_obj"]["ts"]
     stats = trigger_event["stats"]
-    window = trigger_event["buffer_window"]
+    window = [entry for entry in trigger_event["buffer_window"] if entry.get("source") == source]
 
     lines = []
     for entry in window[-100:]:  # last 100 lines max for context
         lvl = entry.get("level", "INFO")
         t = entry.get("ts", "")
-        raw = str(entry.get("raw", ""))[:_MAX_LINE_CHARS]
+        raw = redact(str(entry.get("raw", "")), api_key)[:_MAX_LINE_CHARS]
         lines.append(f"[{lvl}] [{entry.get('source', '?')}] {t}  {raw}")
 
     log_block = "\n".join(lines) if lines else "(no context)"
@@ -76,7 +77,7 @@ STATS:
 - Unique error types: {stats.get('unique_error_types', 0)}
 - Lines in window: {stats.get('total_lines', 0)}
 
-RECENT LOG WINDOW (last 60 seconds):
+RECENT LOG WINDOW:
 {log_block}
 
 Analyze this situation and return your finding as JSON."""
@@ -98,7 +99,7 @@ def _normalize_finding(finding: dict[str, Any]) -> dict[str, Any]:
     confidence = str(finding.get("confidence", "")).strip().lower()
     finding["confidence"] = confidence if confidence in ("high", "medium", "low") else "low"
     finding["kb_used"] = bool(finding.get("kb_used", False))
-    return finding
+    return {key: finding[key] for key in (*_STR_FIELDS, *_LIST_FIELDS, "confidence", "kb_used")}
 
 
 def _parse_finding(raw_text: str) -> dict[str, Any]:
@@ -124,6 +125,12 @@ def _parse_finding(raw_text: str) -> dict[str, Any]:
 
 def _new_alert_id() -> str:
     return f"LW-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:4]}"
+
+
+class LocalAgent:
+    async def analyze(self, event: dict[str, Any]) -> dict[str, Any]:
+        return _fallback_finding(event, f"Local rule matched: {event['rule']}",
+                                 "Inspect the triggering service log.", 0)
 
 
 class GeminiAgent:
@@ -156,7 +163,7 @@ class GeminiAgent:
     async def analyze(self, trigger_event: dict[str, Any]) -> dict[str, Any]:
         """Send trigger event to Gemini LLM and return structured finding."""
         start = time.time()
-        payload = self._build_payload(_format_context(trigger_event))
+        payload = self._build_payload(redact(_format_context(trigger_event, self.api_key), self.api_key))
 
         try:
             content = await generate(
@@ -196,7 +203,7 @@ def _fallback_finding(trigger_event: dict[str, Any], caused_by: str, action: str
         "source": trigger_event["log_obj"]["source"],
         "trigger": trigger_event["rule"],
         "confidence": "low",
-        "root_signal": trigger_event["log_obj"]["raw"][:200],
+        "root_signal": redact(trigger_event["log_obj"]["raw"])[:200],
         "caused_by": caused_by,
         "contributing_factors": [],
         "blast_radius": "unknown",

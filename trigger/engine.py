@@ -28,6 +28,9 @@ class TriggerEngine:
         self.cooldowns = cooldowns
         self.agent_queue = agent_queue
         self.suppression_count = 0
+        self.dropped = 0
+        self.accepted = 0
+        self.context_seconds = 60
 
     def process(self, log_obj: dict, buffer: "RingBuffer") -> None:
         """Evaluate a new log line, THEN add it to the buffer.
@@ -68,7 +71,7 @@ class TriggerEngine:
             return
 
         # The triggering line is not in the buffer yet — append it so the LLM sees it
-        window = buffer.window(seconds=60)
+        window = buffer.window(seconds=self.context_seconds)
         window.append(log_obj)
 
         trigger_event = {
@@ -84,8 +87,9 @@ class TriggerEngine:
         except asyncio.QueueFull:
             # Don't start the cooldowns: the event was dropped, so the next matching
             # line should get another chance to be analyzed.
-            self.suppression_count += 1
+            self.dropped += 1
             return
 
+        self.accepted += 1
         for rule in fired:
             self.cooldowns.record(rule.name, source)
